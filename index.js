@@ -19,7 +19,7 @@ export default {
       const customReferer = reqUrl.searchParams.get("referer");
       const customUa = reqUrl.searchParams.get("ua") || reqUrl.searchParams.get("user-agent");
 
-      // 2. EXTRAER URL (Soporta tanto ?url= como la ruta directa /p/ para no romper BaseURL en DASH)
+      // 2. EXTRAER URL (Soporta ?url= y ruta directa /p/)
       let targetUrl = "";
       if (reqUrl.pathname.startsWith("/p/")) {
         targetUrl = reqUrl.pathname.substring(3) + reqUrl.search;
@@ -29,7 +29,9 @@ export default {
         targetUrl = urlMatches ? urlMatches[1] : reqUrl.searchParams.get("url");
       }
 
-      if (!targetUrl) return new Response("Falta el parámetro ?url=", { status: 400, headers: corsHeaders });
+      if (!targetUrl) {
+        return new Response("Falta el parámetro ?url=", { status: 400, headers: corsHeaders });
+      }
 
       targetUrl = targetUrl
         .replace(/&origin=[^&]+/, "")
@@ -42,7 +44,7 @@ export default {
         }
       } catch (_) {}
 
-      // Si le faltaba el protocolo http:// o https://
+      // Asegurar protocolo
       if (!targetUrl.startsWith("http://") && !targetUrl.startsWith("https://")) {
         targetUrl = "https://" + targetUrl;
       }
@@ -71,7 +73,7 @@ export default {
         upstreamHeaders.set("range", request.headers.get("range"));
       }
 
-      // 4. PETICIÓN CON SOPORTE DE BODY (Esencial para licencias DRM en POST)
+      // 4. PETICIÓN CON SOPORTE DE BODY (para licencias POST, etc.)
       const fetchOptions = {
         method: request.method,
         headers: upstreamHeaders,
@@ -92,30 +94,30 @@ export default {
         });
       }
 
-      const cleanPath = targetUrl.split("?")[0];
-      const baseUrl = cleanPath.substring(0, cleanPath.lastIndexOf("/") + 1);
-
-      // Usamos el prefijo /p/ para que los reproductores DASH no destruyan la URL al concatenar
-      let proxyPrefix = `${reqUrl.origin}/p/`;
+      // 5. RESOLUCIÓN DE RUTAS CON new URL
+      // new URL("./", parsedTarget) garantiza descartar el archivo final, quitar query params y terminar con "/"
+      const baseUrl = new URL("./", parsedTarget).href;
+      const proxyPrefix = `${reqUrl.origin}/p/`;
 
       function makeProxied(pathOrUrl) {
         const trimmed = pathOrUrl.trim();
         if (!trimmed) return "";
-        let full = trimmed;
-        if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
-          full = trimmed.startsWith("/") ? parsedTarget.origin + trimmed : baseUrl + trimmed;
+        try {
+          // Resuelve tanto relativas, relativas a la raíz (/) como URLs absolutas
+          const full = new URL(trimmed, baseUrl).href;
+          return `${proxyPrefix}${full}`;
+        } catch (_) {
+          return `${proxyPrefix}${trimmed}`;
         }
-        return `${proxyPrefix}${full}`;
       }
 
       const cleanTarget = parsedTarget.pathname.toLowerCase();
       const contentType = (res.headers.get("content-type") || "").toLowerCase();
 
-      // Leemos el texto previo para detectar MPD aunque la URL no termine en .mpd
+      // Detección HLS o DASH
       let isHls = cleanTarget.endsWith(".m3u8") || contentType.includes("mpegurl");
       let isDash = cleanTarget.endsWith(".mpd") || contentType.includes("dash+xml");
 
-      // Si aún no sabemos qué es, revisamos si el contenido empieza como XML de DASH
       let responseText = null;
       if (!isHls && !isDash && (contentType.includes("xml") || contentType.includes("text") || cleanTarget.includes("manifest"))) {
         responseText = await res.text();
@@ -127,10 +129,14 @@ export default {
       // CASO A: HLS (.m3u8)
       if (isHls) {
         let text = responseText !== null ? responseText : await res.text();
+        
+        // Reescribir URIs en etiquetas como #EXT-X-KEY, #EXT-X-MAP, etc.
         text = text.replace(/URI="([^"]+)"/g, (m, uri) => `URI="${makeProxied(uri)}"`);
-        text = text.split("\n").map(l => {
-          const t = l.trim();
-          if (!t || t.startsWith("#")) return l;
+        
+        // Reescribir segmentos y playlists anidadas
+        text = text.split("\n").map(line => {
+          const t = line.trim();
+          if (!t || t.startsWith("#")) return line;
           return makeProxied(t);
         }).join("\n");
 
@@ -144,12 +150,11 @@ export default {
         });
       }
 
-      // CASO B: DASH (.mpd) con o sin DRM
+      // CASO B: DASH (.mpd)
       if (isDash) {
         let text = responseText !== null ? responseText : await res.text();
         const proxiedBase = `<BaseURL>${proxyPrefix}${baseUrl}</BaseURL>`;
 
-        // Reemplaza o inyecta BaseURL usando la ruta blindada
         if (/<BaseURL[^>]*>/i.test(text)) {
           text = text.replace(/<BaseURL[^>]*>([^<]+)<\/BaseURL>/gi, (m, p1) => `<BaseURL>${makeProxied(p1)}</BaseURL>`);
         } else {
@@ -166,7 +171,7 @@ export default {
         });
       }
 
-      // CASO C: FRAGMENTOS BINARIOS Y LICENCIAS DRM
+      // CASO C: FRAGMENTOS BINARIOS Y OTRAS RESPUESTAS
       const binaryHeaders = new Headers(res.headers);
       for (const [k, v] of Object.entries(corsHeaders)) {
         binaryHeaders.set(k, v);
