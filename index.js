@@ -15,7 +15,6 @@ export default {
     const customOrigin = reqUrl.searchParams.get("origin");
     const customReferer = reqUrl.searchParams.get("referer");
 
-    // Extraer la URL original limpia
     const rawUrl = request.url;
     const urlMatches = rawUrl.match(/[?&]url=(.+)$/);
     let targetUrl = urlMatches ? urlMatches[1] : reqUrl.searchParams.get("url");
@@ -31,7 +30,6 @@ export default {
 
     const parsedTarget = new URL(targetUrl);
 
-    // Cabeceras hacia el servidor original
     const upstreamHeaders = new Headers();
     upstreamHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
     upstreamHeaders.set("Accept", "*/*");
@@ -45,7 +43,6 @@ export default {
       upstreamHeaders.set("range", request.headers.get("range"));
     }
 
-    // Petición directa al servidor original
     const res = await fetch(targetUrl, {
       method: request.method,
       headers: upstreamHeaders,
@@ -73,7 +70,7 @@ export default {
     const cleanTarget = parsedTarget.pathname.toLowerCase();
     const contentType = (res.headers.get("content-type") || "").toLowerCase();
 
-    // 1. SI ES LISTA HLS (.m3u8)
+    // 1. LISTAS HLS (.m3u8)
     if (cleanTarget.endsWith(".m3u8") || contentType.includes("mpegurl")) {
       let text = await res.text();
       text = text.replace(/URI="([^"]+)"/g, (m, uri) => `URI="${makeProxied(uri)}"`);
@@ -92,7 +89,7 @@ export default {
       });
     }
 
-    // 2. SI ES DASH (.mpd)
+    // 2. DASH (.mpd)
     if (cleanTarget.endsWith(".mpd") || contentType.includes("dash+xml") || contentType.includes("text/xml")) {
       let text = await res.text();
       const proxiedBase = `<BaseURL>${proxyBase}${encodeURIComponent(baseUrl)}</BaseURL>`;
@@ -112,14 +109,12 @@ export default {
       });
     }
 
-    // 3. SEGMENTOS BINARIOS (.ts, .m4s) -> PIPELINE PURO (Zero-Copy)
-    // Cloudflare transmite los bytes directos sin tocarlos ni pasarlos por Node
+    // 3. SEGMENTOS BINARIOS (.ts, .m4s) -> ZERO-COPY DIRECTO
     const binaryHeaders = new Headers(res.headers);
     for (const [k, v] of Object.entries(corsHeaders)) {
       binaryHeaders.set(k, v);
     }
 
-    // Asignar MIME type estricto que exige Hls.js
     if (cleanTarget.endsWith(".ts")) {
       binaryHeaders.set("Content-Type", "video/mp2t");
     } else if (cleanTarget.endsWith(".m4s")) {
