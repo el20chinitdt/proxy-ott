@@ -1,5 +1,4 @@
 export default async (req, context) => {
-  // 1. Manejo de peticiones de validación CORS (Preflight)
   const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
@@ -11,7 +10,6 @@ export default async (req, context) => {
     return new Response(null, { headers: corsHeaders });
   }
 
-  // 2. Extraer y validar la URL del video
   const url = new URL(req.url);
   const targetUrl = url.searchParams.get("url");
 
@@ -23,22 +21,19 @@ export default async (req, context) => {
   try {
     parsedTarget = new URL(targetUrl);
   } catch {
-    return new Response("La URL solicitada es inválida", { status: 400, headers: corsHeaders });
+    return new Response("URL inválida", { status: 400, headers: corsHeaders });
   }
 
-  // 3. Cabeceras para simular un navegador real hacia el servidor de video
   const upstreamHeaders = new Headers();
   upstreamHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
   upstreamHeaders.set("Accept", "*/*");
   upstreamHeaders.set("Referer", parsedTarget.origin + "/");
   upstreamHeaders.set("Origin", parsedTarget.origin);
 
-  // Reenviar la petición de bytes si el reproductor pide saltar en la línea de tiempo
   if (req.headers.has("range")) {
     upstreamHeaders.set("range", req.headers.get("range"));
   }
 
-  // 4. Petición al servidor de video original con captura de errores
   let res;
   try {
     res = await fetch(targetUrl, {
@@ -53,7 +48,6 @@ export default async (req, context) => {
     });
   }
 
-  // Preparar rutas para reescribir todo a través de este proxy en HTTPS
   const proxyBase = `${url.origin}${url.pathname}?url=`;
   const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
 
@@ -73,17 +67,26 @@ export default async (req, context) => {
   }
 
   const contentType = (res.headers.get("content-type") || "").toLowerCase();
+  const isHls = targetUrl.includes(".m3u8") || contentType.includes("mpegurl");
+  const isDash = targetUrl.includes(".mpd") || contentType.includes("dash+xml");
 
-  // 5. CASO A: Es HLS (.m3u8)
-  if (parsedTarget.pathname.endsWith(".m3u8") || contentType.includes("mpegurl") || contentType.includes("application/x-mpegurl")) {
+  // REGLA CLAVE: Cero caché para listas en vivo para que nunca se congele
+  const liveListHeaders = {
+    ...corsHeaders,
+    "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+    "Netlify-CDN-Cache-Control": "no-store",
+  };
+
+  // 1. MANEJO DE HLS (.m3u8)
+  if (isHls) {
     let text = await res.text();
 
-    // Reescribe llaves de cifrado (#EXT-X-KEY:URI=...) y mapas de inicio (#EXT-X-MAP:URI=...)
     text = text.replace(/URI="([^"]+)"/g, (match, uri) => {
       return `URI="${makeProxied(uri)}"`;
     });
 
-    // Reescribe segmentos de video y sub-playlists
     text = text.split("\n").map(line => {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith("#")) return line;
@@ -93,15 +96,14 @@ export default async (req, context) => {
     return new Response(text, {
       status: res.status,
       headers: {
-        ...corsHeaders,
+        ...liveListHeaders,
         "Content-Type": "application/vnd.apple.mpegurl",
-        "Cache-Control": "no-cache, no-store, must-revalidate",
       },
     });
   }
 
-  // 6. CASO B: Es MPEG-DASH (.mpd)
-  if (parsedTarget.pathname.endsWith(".mpd") || contentType.includes("dash+xml")) {
+  // 2. MANEJO DE DASH (.mpd)
+  if (isDash) {
     let text = await res.text();
     const proxiedBase = `<BaseURL>${proxyBase}${encodeURIComponent(baseUrl)}</BaseURL>`;
 
@@ -116,22 +118,28 @@ export default async (req, context) => {
     return new Response(text, {
       status: res.status,
       headers: {
-        ...corsHeaders,
+        ...liveListHeaders,
         "Content-Type": "application/dash+xml",
-        "Cache-Control": "no-cache, no-store, must-revalidate",
       },
     });
   }
 
-  // 7. CASO C: Segmentos binarios (.ts, .m4s, llaves de descifrado, etc.)
-  const responseHeaders = new Headers(res.headers);
-  for (const [k, v] of Object.entries(corsHeaders)) {
-    responseHeaders.set(k, v);
+  // 3. SEGMENTOS BINARIOS DE VIDEO (.ts, .m4s)
+  // Limpiamos cabeceras de red peligrosas que cortan la conexión
+  const cleanHeaders = new Headers(corsHeaders);
+  const safeHeaders = ["content-type", "content-length", "content-range", "accept-ranges"];
+  for (const [k, v] of res.headers.entries()) {
+    if (safeHeaders.includes(k.toLowerCase())) {
+      cleanHeaders.set(k, v);
+    }
   }
+
+  // Permitir que el reproductor guarde los pedazos que ya vio para que no gaste doble datos
+  cleanHeaders.set("Cache-Control", "public, max-age=60");
 
   return new Response(res.body, {
     status: res.status,
-    headers: responseHeaders,
+    headers: cleanHeaders,
   });
 };
 
