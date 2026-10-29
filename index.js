@@ -31,7 +31,7 @@ export default {
 
       const parsedTarget = new URL(targetUrl);
 
-      // TRUCO PARA CLOUDFLARE: Si es una IP numérica, le añadimos .sslip.io para saltar el bloqueo
+      // TRUCO CLOUDFLARE: Convierte IP numérica en dominio sslip.io para saltar el Error 1003
       let fetchUrl = targetUrl;
       const isDirectIp = /^(\d{1,3}\.){3}\d{1,3}$/.test(parsedTarget.hostname);
       if (isDirectIp) {
@@ -56,6 +56,15 @@ export default {
         headers: upstreamHeaders,
         redirect: "follow",
       });
+
+      // Si el servidor original dio error, devolvemos el error directo sin intentar leerlo como video
+      if (!res.ok) {
+        const errorText = await res.text();
+        return new Response(errorText, {
+          status: res.status,
+          headers: { ...corsHeaders, "Content-Type": "text/plain" },
+        });
+      }
 
       const cleanPath = targetUrl.split("?")[0];
       const baseUrl = cleanPath.substring(0, cleanPath.lastIndexOf("/") + 1);
@@ -139,7 +148,7 @@ export default {
       });
 
     } catch (err) {
-      return new Response("Error al procesar: " + err.message, {
+      return new Response("Error al conectar: " + err.message, {
         status: 500,
         headers: corsHeaders,
       });
