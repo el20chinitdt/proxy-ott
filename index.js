@@ -1,3 +1,17 @@
+// Genera dinámicamente una versión de Chrome vigente y sus Client Hints
+function getModernChromeIdentity() {
+  // Chrome 126 salió a mediados de junio 2024 (~1718150400000). Google lanza una versión cada 28 días.
+  const baseTimestamp = 1718150400000;
+  const cycleMs = 28 * 24 * 60 * 60 * 1000;
+  const elapsedCycles = Math.max(0, Math.floor((Date.now() - baseTimestamp) / cycleMs));
+  const chromeMajor = 126 + elapsedCycles;
+
+  const ua = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeMajor}.0.0.0 Safari/537.36`;
+  const secChUa = `"Not/A)Brand";v="8", "Chromium";v="${chromeMajor}", "Google Chrome";v="${chromeMajor}"`;
+
+  return { ua, secChUa };
+}
+
 export default {
   async fetch(request) {
     const corsHeaders = {
@@ -14,12 +28,12 @@ export default {
     try {
       const reqUrl = new URL(request.url);
 
-      // 1. EXTRAER ORIGIN, REFERER Y USER-AGENT
+      // 1. PARÁMETROS MANUALES (Opcionales)
       const customOrigin = reqUrl.searchParams.get("origin");
       const customReferer = reqUrl.searchParams.get("referer");
       const customUa = reqUrl.searchParams.get("ua") || reqUrl.searchParams.get("user-agent");
 
-      // 2. EXTRAER URL (Soporta ?url= y ruta directa /p/)
+      // 2. EXTRACCIÓN Y LIMPIEZA DE URL DESTINO
       let targetUrl = "";
       if (reqUrl.pathname.startsWith("/p/")) {
         targetUrl = reqUrl.pathname.substring(3) + reqUrl.search;
@@ -33,6 +47,7 @@ export default {
         return new Response("Falta el parámetro ?url=", { status: 400, headers: corsHeaders });
       }
 
+      // Eliminar parámetros de control propios de la URL final
       targetUrl = targetUrl
         .replace(/&origin=[^&]+/, "")
         .replace(/&referer=[^&]+/, "")
@@ -44,36 +59,51 @@ export default {
         }
       } catch (_) {}
 
-      // Asegurar protocolo
       if (!targetUrl.startsWith("http://") && !targetUrl.startsWith("https://")) {
         targetUrl = "https://" + targetUrl;
       }
 
       const parsedTarget = new URL(targetUrl);
 
-      // Salto de bloqueo de IPs numéricas en Cloudflare
+      // Bypass de bloqueo de IPs directas en Cloudflare usando sslip.io
       let fetchUrl = targetUrl;
       const isDirectIp = /^(\d{1,3}\.){3}\d{1,3}$/.test(parsedTarget.hostname);
       if (isDirectIp) {
         fetchUrl = targetUrl.replace(parsedTarget.hostname, `${parsedTarget.hostname}.sslip.io`);
       }
 
-      // 3. CABECERAS UPSTREAM
-      const upstreamHeaders = new Headers();
-      const defaultUa = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
-      upstreamHeaders.set("User-Agent", customUa || defaultUa);
-      upstreamHeaders.set("Accept", "*/*");
+      // 3. CABECERAS UPSTREAM BLINDADAS Y AUTO-ACTUALIZABLES
+      const { ua: autoUa, secChUa: autoSecChUa } = getModernChromeIdentity();
+      const finalUa = customUa || autoUa;
 
+      const upstreamHeaders = new Headers();
+      upstreamHeaders.set("User-Agent", finalUa);
+
+      // Sincronizar Client Hints
+      if (finalUa.includes("Chrome")) {
+        upstreamHeaders.set("sec-ch-ua", autoSecChUa);
+        upstreamHeaders.set("sec-ch-ua-mobile", "?0");
+        upstreamHeaders.set("sec-ch-ua-platform", '"Windows"');
+      }
+
+      // Forzar Origin y Referer exactos del destino para neutralizar bloqueos anti-hotlink
       const effectiveOrigin = customOrigin || parsedTarget.origin;
       const effectiveReferer = customReferer || (customOrigin ? `${customOrigin}/` : `${parsedTarget.origin}/`);
       upstreamHeaders.set("Origin", effectiveOrigin);
       upstreamHeaders.set("Referer", effectiveReferer);
 
+      // Contexto de navegación de navegador legítimo
+      upstreamHeaders.set("Accept", "*/*");
+      upstreamHeaders.set("Accept-Language", "es-ES,es;q=0.9,en;q=0.8");
+      upstreamHeaders.set("Sec-Fetch-Site", "cross-origin");
+      upstreamHeaders.set("Sec-Fetch-Mode", "cors");
+      upstreamHeaders.set("Sec-Fetch-Dest", "empty");
+
       if (request.headers.has("range")) {
-        upstreamHeaders.set("range", request.headers.get("range"));
+        upstreamHeaders.set("Range", request.headers.get("range"));
       }
 
-      // 4. PETICIÓN CON SOPORTE DE BODY (para licencias POST, etc.)
+      // 4. EJECUCIÓN DEL FETCH (Soporte POST para peticiones DRM/licencias)
       const fetchOptions = {
         method: request.method,
         headers: upstreamHeaders,
@@ -94,8 +124,7 @@ export default {
         });
       }
 
-      // 5. RESOLUCIÓN DE RUTAS CON new URL
-      // new URL("./", parsedTarget) garantiza descartar el archivo final, quitar query params y terminar con "/"
+      // 5. RESOLUCIÓN DE RUTAS CON new URL (Siempre termina en "/")
       const baseUrl = new URL("./", parsedTarget).href;
       const proxyPrefix = `${reqUrl.origin}/p/`;
 
@@ -103,7 +132,6 @@ export default {
         const trimmed = pathOrUrl.trim();
         if (!trimmed) return "";
         try {
-          // Resuelve tanto relativas, relativas a la raíz (/) como URLs absolutas
           const full = new URL(trimmed, baseUrl).href;
           return `${proxyPrefix}${full}`;
         } catch (_) {
@@ -114,7 +142,6 @@ export default {
       const cleanTarget = parsedTarget.pathname.toLowerCase();
       const contentType = (res.headers.get("content-type") || "").toLowerCase();
 
-      // Detección HLS o DASH
       let isHls = cleanTarget.endsWith(".m3u8") || contentType.includes("mpegurl");
       let isDash = cleanTarget.endsWith(".mpd") || contentType.includes("dash+xml");
 
@@ -130,10 +157,10 @@ export default {
       if (isHls) {
         let text = responseText !== null ? responseText : await res.text();
         
-        // Reescribir URIs en etiquetas como #EXT-X-KEY, #EXT-X-MAP, etc.
+        // Claves DRM, mapas y sub-recursos con atributo URI="..."
         text = text.replace(/URI="([^"]+)"/g, (m, uri) => `URI="${makeProxied(uri)}"`);
         
-        // Reescribir segmentos y playlists anidadas
+        // Segmentos de video y playlists secundarias
         text = text.split("\n").map(line => {
           const t = line.trim();
           if (!t || t.startsWith("#")) return line;
@@ -171,7 +198,7 @@ export default {
         });
       }
 
-      // CASO C: FRAGMENTOS BINARIOS Y OTRAS RESPUESTAS
+      // CASO C: SEGMENTOS BINARIOS (.ts, .m4s, licencias)
       const binaryHeaders = new Headers(res.headers);
       for (const [k, v] of Object.entries(corsHeaders)) {
         binaryHeaders.set(k, v);
