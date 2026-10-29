@@ -10,20 +10,28 @@ export default async (req, context) => {
     return new Response(null, { headers: corsHeaders });
   }
 
-  const url = new URL(req.url);
-  const targetUrl = url.searchParams.get("url");
-
-  if (!targetUrl) {
+  // 1. CAPTURA DE URL COMPLETA (Arregla que no se corten los tokens con & en MPD)
+  const rawUrl = req.url;
+  const urlParamIndex = rawUrl.indexOf("?url=");
+  if (urlParamIndex === -1) {
     return new Response("Falta el parámetro ?url=", { status: 400, headers: corsHeaders });
   }
+
+  let targetUrl = rawUrl.substring(urlParamIndex + 5);
+  try {
+    if (targetUrl.includes("%3A") || targetUrl.includes("%2F")) {
+      targetUrl = decodeURIComponent(targetUrl);
+    }
+  } catch (_) {}
 
   let parsedTarget;
   try {
     parsedTarget = new URL(targetUrl);
   } catch {
-    return new Response("URL inválida", { status: 400, headers: corsHeaders });
+    return new Response("URL inválida: " + targetUrl, { status: 400, headers: corsHeaders });
   }
 
+  // 2. Cabeceras limpias simulando navegador
   const upstreamHeaders = new Headers();
   upstreamHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
   upstreamHeaders.set("Accept", "*/*");
@@ -48,30 +56,25 @@ export default async (req, context) => {
     });
   }
 
-  const proxyBase = `${url.origin}${url.pathname}?url=`;
+  const proxyBase = `${new URL(req.url).origin}/proxy?url=`;
   const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
 
-  function toAbsolute(pathOrUrl) {
-    const trimmed = pathOrUrl.trim();
-    if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
-      return trimmed;
-    }
-    if (trimmed.startsWith("/")) {
-      return parsedTarget.origin + trimmed;
-    }
-    return baseUrl + trimmed;
-  }
-
   function makeProxied(pathOrUrl) {
-    return `${proxyBase}${encodeURIComponent(toAbsolute(pathOrUrl))}`;
+    const trimmed = pathOrUrl.trim();
+    if (!trimmed) return "";
+    let full = trimmed;
+    if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
+      full = trimmed.startsWith("/") ? parsedTarget.origin + trimmed : baseUrl + trimmed;
+    }
+    return `${proxyBase}${encodeURIComponent(full)}`;
   }
 
   const contentType = (res.headers.get("content-type") || "").toLowerCase();
   const isHls = targetUrl.includes(".m3u8") || contentType.includes("mpegurl");
-  const isDash = targetUrl.includes(".mpd") || contentType.includes("dash+xml");
+  const isDash = targetUrl.includes(".mpd") || contentType.includes("dash+xml") || contentType.includes("text/xml");
 
-  // REGLA CLAVE: Cero caché para listas en vivo para que nunca se congele
-  const liveListHeaders = {
+  // CABECERA CERO CACHÉ PARA TRANSMISIONES EN VIVO
+  const noCacheHeaders = {
     ...corsHeaders,
     "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
     "Pragma": "no-cache",
@@ -79,13 +82,11 @@ export default async (req, context) => {
     "Netlify-CDN-Cache-Control": "no-store",
   };
 
-  // 1. MANEJO DE HLS (.m3u8)
+  // CASO A: HLS (.m3u8)
   if (isHls) {
     let text = await res.text();
 
-    text = text.replace(/URI="([^"]+)"/g, (match, uri) => {
-      return `URI="${makeProxied(uri)}"`;
-    });
+    text = text.replace(/URI="([^"]+)"/g, (match, uri) => `URI="${makeProxied(uri)}"`);
 
     text = text.split("\n").map(line => {
       const trimmed = line.trim();
@@ -96,21 +97,19 @@ export default async (req, context) => {
     return new Response(text, {
       status: res.status,
       headers: {
-        ...liveListHeaders,
+        ...noCacheHeaders,
         "Content-Type": "application/vnd.apple.mpegurl",
       },
     });
   }
 
-  // 2. MANEJO DE DASH (.mpd)
+  // CASO B: DASH (.mpd)
   if (isDash) {
     let text = await res.text();
     const proxiedBase = `<BaseURL>${proxyBase}${encodeURIComponent(baseUrl)}</BaseURL>`;
 
     if (text.includes("<BaseURL>")) {
-      text = text.replace(/<BaseURL>([^<]+)<\/BaseURL>/g, (m, p1) => {
-        return `<BaseURL>${makeProxied(p1)}</BaseURL>`;
-      });
+      text = text.replace(/<BaseURL>([^<]+)<\/BaseURL>/g, (m, p1) => `<BaseURL>${makeProxied(p1)}</BaseURL>`);
     } else {
       text = text.replace(/<MPD([^>]*)>/i, `<MPD$1>\n  ${proxiedBase}`);
     }
@@ -118,14 +117,14 @@ export default async (req, context) => {
     return new Response(text, {
       status: res.status,
       headers: {
-        ...liveListHeaders,
-        "Content-Type": "application/dash+xml",
+        ...noCacheHeaders,
+        "Content-Type": "application/dash+xml; charset=utf-8",
       },
     });
   }
 
-  // 3. SEGMENTOS BINARIOS DE VIDEO (.ts, .m4s)
-  // Limpiamos cabeceras de red peligrosas que cortan la conexión
+  // CASO C: FRAGMENTOS DE VIDEO DIRECTOS (.ts, .m4s)
+  // Túnel ultrarrápido sin tocar el contenido para que no se frene el buffer
   const cleanHeaders = new Headers(corsHeaders);
   const safeHeaders = ["content-type", "content-length", "content-range", "accept-ranges"];
   for (const [k, v] of res.headers.entries()) {
@@ -134,8 +133,7 @@ export default async (req, context) => {
     }
   }
 
-  // Permitir que el reproductor guarde los pedazos que ya vio para que no gaste doble datos
-  cleanHeaders.set("Cache-Control", "public, max-age=60");
+  cleanHeaders.set("Cache-Control", "public, max-age=120");
 
   return new Response(res.body, {
     status: res.status,
