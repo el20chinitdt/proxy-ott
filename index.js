@@ -1,5 +1,5 @@
 // ============================================================================
-// CLOUDFLARE WORKER: CORS PROXY + ADAPTADOR PARA CESBO ASTRA & HLS/DASH
+// CLOUDFLARE WORKER: PROXY MULTI-FORMATO (DASH/HLS) + CACHÉ + ANTI-ROBO
 // ============================================================================
 
 // 1. Generador dinámico de identidad Chrome y Client Hints
@@ -78,29 +78,23 @@ export default {
       }
 
       // ========================================================================
-      // PROTECCIÓN ANTI-ABUSO (BLOQUEO DE CUALQUIER PÁGINA WEB AJENA)
+      // PROTECCIÓN ANTI-ROBO: LISTA EXACTA DE TODOS TUS DOMINIOS PERMITIDOS
       // ========================================================================
       const DOMINIOS_PERMITIDOS = [
-        "canalesenvivodeargentina.blogspot",
+        "encrypthtmlaes256.edgeone.app",
         "el20chinitdt.github.io",
-        "edgeone.app",
         "isdntek.com",
-        "blogger.com"
+        "canalesenvivodeargentina.blogspot.com"
       ];
 
-      const reqOriginHeader = request.headers.get("Origin");
-      const reqRefererHeader = request.headers.get("Referer");
-      const origenDetectado = reqOriginHeader || reqRefererHeader;
+      const origenPeticion = request.headers.get("Origin") || request.headers.get("Referer") || "";
+      const esAutorizado = DOMINIOS_PERMITIDOS.some(dominio => origenPeticion.includes(dominio));
 
-      // Si la petición proviene identificada desde una web que NO es tuya:
-      if (origenDetectado && origenDetectado !== "null") {
-        const esValido = DOMINIOS_PERMITIDOS.some(dominio => origenDetectado.includes(dominio));
-        if (!esValido) {
-          return new Response("Acceso Denegado: Proxy no autorizado", {
-            status: 403,
-            headers: { ...corsHeaders, "Content-Type": "text/plain; charset=utf-8" }
-          });
-        }
+      if (!esAutorizado) {
+        return new Response("Acceso Denegado: Dominio no autorizado", {
+          status: 403,
+          headers: { ...corsHeaders, "Content-Type": "text/plain; charset=utf-8" }
+        });
       }
 
       // 1. EXTRACCIÓN DE PARÁMETROS DE CONTROL
@@ -112,6 +106,7 @@ export default {
       let targetUrl = "";
       if (reqUrl.pathname.startsWith("/p/")) {
         targetUrl = reqUrl.pathname.substring(3) + reqUrl.search;
+        // Corrección de barras duplicadas o comprimidas (https:/ -> https://)
         targetUrl = targetUrl.replace(/^(https?):\/+([^\/])/i, "$1://$2");
       } else {
         const rawUrl = request.url;
@@ -186,7 +181,7 @@ export default {
         upstreamHeaders.set("Range", request.headers.get("range"));
       }
 
-      // 4. FETCH AL ORIGEN (CON CACHÉ INTELIGENTE)
+      // 4. FETCH AL ORIGEN (CON CACHÉ INTELIGENTE DE 15 SEGUNDOS)
       const cleanTarget = parsedTarget.pathname.toLowerCase();
       const isSegment = cleanTarget.endsWith(".m4s") || (cleanTarget.endsWith(".ts") && !cleanTarget.includes("/play/"));
 
