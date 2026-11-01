@@ -77,6 +77,32 @@ export default {
         return new Response("OK", { status: 200, headers: corsHeaders });
       }
 
+      // ========================================================================
+      // PROTECCIÓN ANTI-ABUSO (BLOQUEO DE CUALQUIER PÁGINA WEB AJENA)
+      // ========================================================================
+      const DOMINIOS_PERMITIDOS = [
+        "canalesenvivodeargentina.blogspot",
+        "el20chinitdt.github.io",
+        "edgeone.app",
+        "isdntek.com",
+        "blogger.com"
+      ];
+
+      const reqOriginHeader = request.headers.get("Origin");
+      const reqRefererHeader = request.headers.get("Referer");
+      const origenDetectado = reqOriginHeader || reqRefererHeader;
+
+      // Si la petición proviene identificada desde una web que NO es tuya:
+      if (origenDetectado && origenDetectado !== "null") {
+        const esValido = DOMINIOS_PERMITIDOS.some(dominio => origenDetectado.includes(dominio));
+        if (!esValido) {
+          return new Response("Acceso Denegado: Proxy no autorizado", {
+            status: 403,
+            headers: { ...corsHeaders, "Content-Type": "text/plain; charset=utf-8" }
+          });
+        }
+      }
+
       // 1. EXTRACCIÓN DE PARÁMETROS DE CONTROL
       const customOrigin = reqUrl.searchParams.get("origin");
       const customReferer = reqUrl.searchParams.get("referer");
@@ -86,7 +112,6 @@ export default {
       let targetUrl = "";
       if (reqUrl.pathname.startsWith("/p/")) {
         targetUrl = reqUrl.pathname.substring(3) + reqUrl.search;
-        // Corrección de barras duplicadas o reducidas
         targetUrl = targetUrl.replace(/^(https?):\/+([^\/])/i, "$1://$2");
       } else {
         const rawUrl = request.url;
