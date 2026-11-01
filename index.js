@@ -81,10 +81,10 @@ export default {
       // PROTECCIÓN ANTI-ROBO: LISTA EXACTA DE TODOS TUS DOMINIOS PERMITIDOS
       // ========================================================================
       const DOMINIOS_PERMITIDOS = [
-        "encrypthtmlaes256.edgeone.app",
+        "https://encrypthtmlaes256.edgeone.app",
         "https://el20chinitdt.github.io/Generador-de-Links-/index.html",
         "https://isdntek.com/tagbot/encryptor.htm",
-        "canalesenvivodeargentina.blogspot.com"
+        "https://canalesenvivodeargentina.blogspot.com"
       ];
 
       const origenPeticion = request.headers.get("Origin") || request.headers.get("Referer") || "";
