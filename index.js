@@ -82,8 +82,8 @@ export default {
       // ========================================================================
       const DOMINIOS_PERMITIDOS = [
         "encrypthtmlaes256.edgeone.app",
-        "el20chinitdt.github.io",
-        "isdntek.com",
+        "https://el20chinitdt.github.io/Generador-de-Links-/index.html",
+        "https://isdntek.com/tagbot/encryptor.htm",
         "canalesenvivodeargentina.blogspot.com"
       ];
 
