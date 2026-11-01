@@ -1,10 +1,11 @@
 // ============================================================================
-// CLOUDFLARE WORKER: CORS PROXY + ADAPTADOR PARA CESBO ASTRA, HLS Y DASH
+// CLOUDFLARE WORKER: CORS PROXY + ADAPTADOR PARA CESBO ASTRA & HLS/DASH
 // ============================================================================
 
+// 1. Generador dinámico de identidad Chrome y Client Hints
 function getModernChromeIdentity() {
-  const baseTimestamp = 1718150400000;
-  const cycleMs = 28 * 24 * 60 * 60 * 1000;
+  const baseTimestamp = 1718150400000; // Chrome 126 (~junio 2024)
+  const cycleMs = 28 * 24 * 60 * 60 * 1000; // Ciclo de 4 semanas por versión
   const elapsedCycles = Math.max(0, Math.floor((Date.now() - baseTimestamp) / cycleMs));
   const chromeMajor = 126 + elapsedCycles;
 
@@ -14,13 +15,16 @@ function getModernChromeIdentity() {
   return { ua, secChUa };
 }
 
+// 2. Adaptador y saneador de manifiestos HLS emitidos por Cesbo Astra
 function patchAstraHlsManifest(text, makeProxied) {
   let patched = text.replace(/URI="([^"]+)"/g, (m, uri) => `URI="${makeProxied(uri)}"`);
+
   const lines = patched.split("\n");
   const processedLines = [];
 
   for (let line of lines) {
     const trimmed = line.trim();
+
     if (!trimmed) {
       processedLines.push(line);
       continue;
@@ -51,7 +55,7 @@ function patchAstraHlsManifest(text, makeProxied) {
 }
 
 export default {
-  async fetch(request) {
+  async fetch(request, env, ctx) {
     const reqOrigin = request.headers.get("Origin");
 
     const corsHeaders = {
@@ -73,17 +77,16 @@ export default {
         return new Response("OK", { status: 200, headers: corsHeaders });
       }
 
+      // 1. EXTRACCIÓN DE PARÁMETROS DE CONTROL
       const customOrigin = reqUrl.searchParams.get("origin");
       const customReferer = reqUrl.searchParams.get("referer");
       const customUa = reqUrl.searchParams.get("ua") || reqUrl.searchParams.get("user-agent");
 
-      // 1. EXTRACCIÓN Y NORMALIZACIÓN DE LA URL DESTINO
+      // 2. EXTRACCIÓN DE URL DESTINO
       let targetUrl = "";
       if (reqUrl.pathname.startsWith("/p/")) {
-        // Obtenemos todo lo que viene después de /p/
         targetUrl = reqUrl.pathname.substring(3) + reqUrl.search;
-        
-        // CORRECCIÓN CRÍTICA DE BARRAS: si viene como "https:/dominio..." lo transformamos en "https://dominio..."
+        // Corrección de barras duplicadas o reducidas
         targetUrl = targetUrl.replace(/^(https?):\/+([^\/])/i, "$1://$2");
       } else {
         const rawUrl = request.url;
@@ -109,25 +112,24 @@ export default {
         }
       } catch (_) {}
 
-      // Asegurar protocolo bien formado
-      if (!/^https?:\/\//i.test(targetUrl)) {
+      if (!targetUrl.startsWith("http://") && !targetUrl.startsWith("https://")) {
         targetUrl = "https://" + targetUrl.replace(/^\/+/, "");
       }
 
       const parsedTarget = new URL(targetUrl);
 
+      // Bypass de bloqueo de IPs directas de Cloudflare utilizando wildcard DNS
       let fetchUrl = targetUrl;
       const isDirectIp = /^(\d{1,3}\.){3}\d{1,3}$/.test(parsedTarget.hostname);
       if (isDirectIp) {
         fetchUrl = targetUrl.replace(parsedTarget.hostname, `${parsedTarget.hostname}.sslip.io`);
       }
 
-      // 2. CABECERAS UPSTREAM (CON HOST EXPLÍCITO)
+      // 3. CABECERAS UPSTREAM BLINDADAS
       const { ua: autoUa, secChUa: autoSecChUa } = getModernChromeIdentity();
       const finalUa = customUa || autoUa;
 
       const upstreamHeaders = new Headers();
-      // Host explícito hacia el servidor destino:
       upstreamHeaders.set("Host", parsedTarget.host);
       upstreamHeaders.set("User-Agent", finalUa);
 
@@ -147,6 +149,7 @@ export default {
       upstreamHeaders.set("Sec-Fetch-Site", "cross-origin");
       upstreamHeaders.set("Sec-Fetch-Mode", "cors");
       upstreamHeaders.set("Sec-Fetch-Dest", "empty");
+
       upstreamHeaders.set("Cache-Control", "no-cache");
       upstreamHeaders.set("Pragma", "no-cache");
 
@@ -158,11 +161,20 @@ export default {
         upstreamHeaders.set("Range", request.headers.get("range"));
       }
 
-      // 3. PETICIÓN UPSTREAM
+      // 4. FETCH AL ORIGEN (CON CACHÉ INTELIGENTE)
+      const cleanTarget = parsedTarget.pathname.toLowerCase();
+      const isSegment = cleanTarget.endsWith(".m4s") || (cleanTarget.endsWith(".ts") && !cleanTarget.includes("/play/"));
+
       const fetchOptions = {
         method: request.method,
         headers: upstreamHeaders,
         redirect: "follow",
+        cf: isSegment ? {
+          cacheEverything: true,
+          cacheTtlByStatus: { "200-299": 15, "404": 1, "500-599": 0 }
+        } : {
+          cacheEverything: false
+        }
       };
 
       if (request.method !== "GET" && request.method !== "HEAD") {
@@ -187,7 +199,7 @@ export default {
         });
       }
 
-      // 4. RESOLUCIÓN DE RUTAS
+      // 5. HELPER PARA RECONSTRUIR URLs RELATIVAS A TRAVÉS DEL PROXY
       const baseUrl = new URL("./", parsedTarget).href;
       const proxyPrefix = `${reqUrl.origin}/p/`;
       const manifestSearchParams = parsedTarget.search;
@@ -206,7 +218,7 @@ export default {
         }
       }
 
-      const cleanTarget = parsedTarget.pathname.toLowerCase();
+      // 6. DETECCIÓN DE CONTENIDO
       const rawContentType = (res.headers.get("content-type") || "").toLowerCase();
 
       let isHls = cleanTarget.endsWith(".m3u8") || rawContentType.includes("mpegurl");
@@ -239,13 +251,14 @@ export default {
         return h;
       }
 
-      // CASO A: HLS (.m3u8)
+      // CASO A: HLS (.m3u8) CON ADAPTADOR CESBO ASTRA
       if (isHls) {
         let text = responseText !== null ? responseText : await res.text();
         text = patchAstraHlsManifest(text, makeProxied);
 
         const hlsHeaders = createResponseHeaders("application/vnd.apple.mpegurl; charset=utf-8");
         hlsHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate");
+
         return new Response(text, { status: res.status, headers: hlsHeaders });
       }
 
@@ -262,15 +275,24 @@ export default {
 
         const dashHeaders = createResponseHeaders("application/dash+xml; charset=utf-8");
         dashHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate");
+
         return new Response(text, { status: res.status, headers: dashHeaders });
       }
 
-      // CASO C: SEGMENTOS BINARIOS (.m4s, .ts)
+      // CASO C: SEGMENTOS BINARIOS (.ts, .m4s) O STREAM CONTINUO MPEG-TS DIRECTO DE ASTRA
       const binaryHeaders = createResponseHeaders();
-      if (cleanTarget.endsWith(".m4s")) {
-        binaryHeaders.set("Content-Type", "video/iso.segment");
-      } else if (cleanTarget.endsWith(".ts") || rawContentType.includes("mp2t")) {
+
+      const isAstraDirectTs = rawContentType.includes("mp2t") || 
+                              rawContentType.includes("octet-stream") || 
+                              cleanTarget.endsWith(".ts") ||
+                              cleanTarget.includes("/play/");
+
+      if (isAstraDirectTs) {
         binaryHeaders.set("Content-Type", "video/mp2t");
+        binaryHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate");
+      } else if (cleanTarget.endsWith(".m4s")) {
+        binaryHeaders.set("Content-Type", "video/iso.segment");
+        binaryHeaders.set("Cache-Control", "public, max-age=15");
       }
 
       return new Response(res.body, {
