@@ -1,5 +1,5 @@
 // ============================================================================
-// CLOUDFLARE WORKER: CORS PROXY + ADAPTADOR PARA CESBO ASTRA & HLS/DASH
+// CLOUDFLARE WORKER: PROXY MULTI-FORMATO (DASH/HLS) + CACHÉ + ANTI-ROBO
 // ============================================================================
 
 // 1. Generador dinámico de identidad Chrome y Client Hints
@@ -77,6 +77,26 @@ export default {
         return new Response("OK", { status: 200, headers: corsHeaders });
       }
 
+      // ========================================================================
+      // PROTECCIÓN ANTI-ROBO: LISTA EXACTA DE TODOS TUS DOMINIOS PERMITIDOS
+      // ========================================================================
+      const DOMINIOS_PERMITIDOS = [
+        "encrypthtmlaes256.edgeone.app",
+        "el20chinitdt.github.io",
+        "isdntek.com",
+        "canalesenvivodeargentina.blogspot.com"
+      ];
+
+      const origenPeticion = request.headers.get("Origin") || request.headers.get("Referer") || "";
+      const esAutorizado = DOMINIOS_PERMITIDOS.some(dominio => origenPeticion.includes(dominio));
+
+      if (!esAutorizado) {
+        return new Response("Acceso Denegado: Dominio no autorizado", {
+          status: 403,
+          headers: { ...corsHeaders, "Content-Type": "text/plain; charset=utf-8" }
+        });
+      }
+
       // 1. EXTRACCIÓN DE PARÁMETROS DE CONTROL
       const customOrigin = reqUrl.searchParams.get("origin");
       const customReferer = reqUrl.searchParams.get("referer");
@@ -86,7 +106,7 @@ export default {
       let targetUrl = "";
       if (reqUrl.pathname.startsWith("/p/")) {
         targetUrl = reqUrl.pathname.substring(3) + reqUrl.search;
-        // Corrección de barras duplicadas o reducidas
+        // Corrección de barras duplicadas o comprimidas (https:/ -> https://)
         targetUrl = targetUrl.replace(/^(https?):\/+([^\/])/i, "$1://$2");
       } else {
         const rawUrl = request.url;
@@ -161,7 +181,7 @@ export default {
         upstreamHeaders.set("Range", request.headers.get("range"));
       }
 
-      // 4. FETCH AL ORIGEN (CON CACHÉ INTELIGENTE)
+      // 4. FETCH AL ORIGEN (CON CACHÉ INTELIGENTE DE 15 SEGUNDOS)
       const cleanTarget = parsedTarget.pathname.toLowerCase();
       const isSegment = cleanTarget.endsWith(".m4s") || (cleanTarget.endsWith(".ts") && !cleanTarget.includes("/play/"));
 
