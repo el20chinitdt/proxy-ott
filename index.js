@@ -1,92 +1,115 @@
 // ============================================================================
-// CLOUDFLARE WORKER: CORS PROXY + ADAPTADOR PARA CESBO ASTRA & HLS/DASH
-// Versión con caché mejorada y tolerancia a fallos del origen
+// CLOUDFLARE WORKER: PROXY ASTRA / HLS / DASH (ESPECIAL PARA *.WORKERS.DEV)
+// Sin dependencias de dominio propio. RAM Micro-Cache + Request Coalescing.
 // ============================================================================
 
-// ---------------------------------------------------------------------------
-// CONFIGURACIÓN DE CACHÉ / RESILIENCIA (ajusta a la duración de tus segmentos)
-// ---------------------------------------------------------------------------
-const SEGMENT_TTL_S = 60;       // vida de un segmento en el edge (debe ser > ventana del playlist)
-const MANIFEST_TTL_S = 1;       // micro-caché del manifiesto live (≤ 1/2 duración de segmento)
-const STALE_MAX_MS = 30000;     // cuánto tiempo servir el último manifiesto bueno si el origen cae
-const UPSTREAM_TIMEOUT_MS = 6000; // ms máximos para recibir cabeceras del origen
-const UPSTREAM_RETRIES = 2;     // reintentos ante 5xx / timeout / (404 en segmentos)
-const PREFETCH_COUNT = 2;       // últimos N segmentos del manifiesto que se precalientan (0 = off)
+const CONFIG = {
+  MANIFEST_TTL_MS: 1500,     // Duración del manifiesto en RAM (1.5 segundos)
+  STALE_FALLBACK_MS: 30000,  // Cuánto tiempo aguantar con el último manifiesto si Astra cae
+  UPSTREAM_TIMEOUT_MS: 6000, // Timeout para conectar al servidor
+  UPSTREAM_RETRIES: 2,       // Reintentos en caso de microcorte de red
+  DEFAULT_VIDEO_CODEC: 'avc1.4d401f,mp4a.40.2', // Fallback si Astra omite códecs
+};
 
-// 1. Identidad de navegador COHERENTE (UA + Client Hints + Sec-Fetch-*)
+// ---------------------------------------------------------------------------
+// 1. MEMORIA RAM LOCAL (Vive en el nodo de Cloudflare mientras haya tráfico)
+// ---------------------------------------------------------------------------
+const MEM_CACHE = new Map();         // Almacena manifiestos procesados
+const IN_FLIGHT_REQUESTS = new Map(); // Colapsa peticiones idénticas a 1 sola
 
-// Versión mayor de Chrome. Lo correcto es fijarla con la variable CHROME_MAJOR del Worker
-// (consulta chromereleases.googleblog.com). Si no existe, se estima desde Chrome 149
-// (estable ~2 jun 2026) con ciclos de 4 semanas y 1 versión de margen.
-function currentChromeMajor(env) {
-  const fromEnv = parseInt(env && env.CHROME_MAJOR, 10);
+function getFromRam(key) {
+  const item = MEM_CACHE.get(key);
+  if (!item) return null;
+  const age = Date.now() - item.time;
+  if (age <= CONFIG.MANIFEST_TTL_MS) {
+    return { data: item.data, contentType: item.contentType, isStale: false };
+  }
+  if (age <= CONFIG.STALE_FALLBACK_MS) {
+    return { data: item.data, contentType: item.contentType, isStale: true };
+  }
+  MEM_CACHE.delete(key);
+  return null;
+}
+
+function saveToRam(key, data, contentType) {
+  // Limpieza preventiva si el mapa crece demasiado
+  if (MEM_CACHE.size > 100) {
+    const oldestKey = MEM_CACHE.keys().next().value;
+    MEM_CACHE.delete(oldestKey);
+  }
+  MEM_CACHE.set(key, { data, contentType, time: Date.now() });
+}
+
+// ---------------------------------------------------------------------------
+// 2. IDENTIDAD Y NAVEGADOR DINÁMICO (Para evitar bloqueos de firewalls)
+// ---------------------------------------------------------------------------
+function getChromeMajor(env) {
+  const fromEnv = parseInt(env?.CHROME_MAJOR, 10);
   if (fromEnv > 0) return fromEnv;
-  const anchor = Date.UTC(2026, 5, 2);
-  const cycles = Math.max(0, Math.floor((Date.now() - anchor) / (28 * 24 * 60 * 60 * 1000)));
-  return 149 + Math.max(0, cycles - 1);
+  const anchorDate = Date.UTC(2024, 0, 1);
+  const weeksElapsed = Math.floor((Date.now() - anchorDate) / (1000 * 60 * 60 * 24 * 7));
+  return 120 + Math.floor(weeksElapsed / 4);
 }
 
-// Algoritmo de Chromium para sec-ch-ua: la marca "GREASE", su versión y el ORDEN de
-// las tres marcas cambian con la versión mayor (no es un texto fijo).
-function chromeBrandList(major) {
+function buildChromeBrandList(major) {
   const chars = [" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_"];
-  const versions = ["8", "99", "24"];
-  const orders = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
-  const greaseBrand = `Not${chars[major % chars.length]}A${chars[(major + 1) % chars.length]}Brand`;
-  const order = orders[major % orders.length];
-  const list = [];
-  list[order[0]] = `"${greaseBrand}";v="${versions[major % 3]}"`;
-  list[order[1]] = `"Chromium";v="${major}"`;
-  list[order[2]] = `"Google Chrome";v="${major}"`;
-  return list.join(", ");
+  const greaseChar1 = chars[major % chars.length];
+  const greaseChar2 = chars[(major + 1) % chars.length];
+  const greaseBrand = `Not${greaseChar1}A${greaseChar2}Brand`;
+  const greaseVer = ["8", "99", "24"][major % 3];
+  
+  const orders = [
+    [`"${greaseBrand}";v="${greaseVer}"`, `"Chromium";v="${major}"`, `"Google Chrome";v="${major}"`],
+    [`"${greaseBrand}";v="${greaseVer}"`, `"Google Chrome";v="${major}"`, `"Chromium";v="${major}"`],
+    [`"Chromium";v="${major}"`, `"${greaseBrand}";v="${greaseVer}"`, `"Google Chrome";v="${major}"`],
+  ];
+  return orders[major % orders.length].join(", ");
 }
 
-// Client Hints derivados del UA que realmente se envía (null si no es Chrome "puro")
-function chromeHintsFromUa(ua) {
+function buildChromeHints(ua) {
   const m = ua.match(/Chrome\/(\d+)/);
-  if (!m || /Edg\/|OPR\/|Firefox\//.test(ua)) return null;
-  const platform = /Android/.test(ua) ? "Android"
-    : /Windows/.test(ua) ? "Windows"
-    : /Macintosh/.test(ua) ? "macOS"
-    : /CrOS/.test(ua) ? "Chrome OS"
-    : /Linux|X11/.test(ua) ? "Linux" : null;
-  if (!platform) return null;
+  if (!m || /Edg\/|OPR\/|Firefox\//i.test(ua)) return null;
+  const major = parseInt(m[1], 10);
+  
+  let platform = '"Windows"';
+  if (/Android/i.test(ua)) platform = '"Android"';
+  else if (/Macintosh|Mac OS X/i.test(ua)) platform = '"macOS"';
+  else if (/Linux/i.test(ua)) platform = '"Linux"';
+
   return {
-    secChUa: chromeBrandList(parseInt(m[1], 10)),
-    mobile: /Mobile/.test(ua) ? "?1" : "?0",
-    platform: `"${platform}"`,
+    secChUa: buildChromeBrandList(major),
+    mobile: /Mobile/i.test(ua) ? "?1" : "?0",
+    platform,
   };
 }
 
-// La identidad (origin/referer/ua) viaja en la RUTA de las URLs reescritas: /i/<id>/<url>.
-// En la query se perdía: al resolver URLs relativas (p. ej. DASH BaseURL) la query se descarta.
 function encodeIdentity(id) {
   const json = JSON.stringify({ o: id.o || undefined, r: id.r || undefined, u: id.u || undefined });
   const bytes = new TextEncoder().encode(json);
-  let bin = "";
-  for (const b of bytes) bin += String.fromCharCode(b);
-  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  let binary = "";
+  for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 function decodeIdentity(str) {
   try {
-    const b64 = str.replace(/-/g, "+").replace(/_/g, "/");
-    const bin = atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4));
-    const json = new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0)));
-    const o = JSON.parse(json);
-    return { o: o.o || null, r: o.r || null, u: o.u || null };
+    let b64 = str.replace(/-/g, "+").replace(/_/g, "/");
+    while (b64.length % 4) b64 += "=";
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const parsed = JSON.parse(new TextDecoder().decode(bytes));
+    return { o: parsed.o || null, r: parsed.r || null, u: parsed.u || null };
   } catch (_) {
     return { o: null, r: null, u: null };
   }
 }
 
-// Un navegador envía como Origin solo esquema+host+puerto (sin ruta ni "/" final)
 function normalizeOrigin(value) {
   if (!value) return null;
   try { return new URL(value).origin; } catch (_) { return value; }
 }
 
-// Cabeceras upstream: cada una existe solo si un cliente real con ese UA la enviaría.
 function buildUpstreamHeaders({ request, parsedTarget, ua, origin, referer, chromeMajor }) {
   const finalUa = ua ||
     `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeMajor}.0.0.0 Safari/537.36`;
@@ -95,86 +118,61 @@ function buildUpstreamHeaders({ request, parsedTarget, ua, origin, referer, chro
   h.set("User-Agent", finalUa);
   h.set("Accept", "*/*");
 
-  const isBrowser = /^Mozilla\/5\.0/.test(finalUa);
+  const isBrowser = /^Mozilla\/5\.0/i.test(finalUa);
+  const effOrigin = origin || parsedTarget.origin;
 
-  // Navegador: Origin/Referer por defecto = el propio destino. Reproductor (VLC, ExoPlayer,
-  // Lavf...): no manda Origin ni Referer, salvo que se pidan explícitamente.
   if (origin || referer || isBrowser) {
-    const effOrigin = origin || parsedTarget.origin;
     h.set("Origin", effOrigin);
     h.set("Referer", referer || `${effOrigin}/`);
   }
 
-  if (isBrowser) {
-    h.set("Accept-Language", "es-ES,es;q=0.9,en;q=0.8");
-
-    // Chrome solo manda Sec-Fetch-* y Client Hints a destinos HTTPS. Con http://IP:puerto
-    // (típico de Astra) enviarlos delata que la petición no viene de un navegador real.
-    if (parsedTarget.protocol === "https:") {
-      const effOrigin = origin || parsedTarget.origin;
-      h.set("Sec-Fetch-Site", effOrigin === parsedTarget.origin ? "same-origin" : "cross-site");
-      h.set("Sec-Fetch-Mode", "cors");
-      h.set("Sec-Fetch-Dest", "empty");
-
-      const hints = chromeHintsFromUa(finalUa);
-      if (hints) {
-        h.set("sec-ch-ua", hints.secChUa);
-        h.set("sec-ch-ua-mobile", hints.mobile);
-        h.set("sec-ch-ua-platform", hints.platform);
-      }
+  if (isBrowser && parsedTarget.protocol === "https:") {
+    h.set("Sec-Fetch-Site", effOrigin === parsedTarget.origin ? "same-origin" : "cross-site");
+    h.set("Sec-Fetch-Mode", "cors");
+    h.set("Sec-Fetch-Dest", "empty");
+    const hints = buildChromeHints(finalUa);
+    if (hints) {
+      h.set("sec-ch-ua", hints.secChUa);
+      h.set("sec-ch-ua-mobile", hints.mobile);
+      h.set("sec-ch-ua-platform", hints.platform);
     }
   }
 
-  if (request.headers.has("cookie")) h.set("Cookie", request.headers.get("cookie"));
   if (request.headers.has("range")) h.set("Range", request.headers.get("range"));
+  if (request.headers.has("cookie")) h.set("Cookie", request.headers.get("cookie"));
   return h;
 }
 
-// 2. Adaptador y saneador de manifiestos HLS emitidos por Cesbo Astra
+// ---------------------------------------------------------------------------
+// 3. PARSEO DE MANIFIESTOS (ASTRA HLS / DASH)
+// ---------------------------------------------------------------------------
 function patchAstraHlsManifest(text, makeProxied) {
-  let patched = text.replace(/URI="([^"]+)"/g, (m, uri) => `URI="${makeProxied(uri)}"`);
-
+  let patched = text.replace(/URI="([^"]+)"/g, (_, uri) => `URI="${makeProxied(uri)}"`);
   const lines = patched.split("\n");
-  const processedLines = [];
+  const processed = [];
 
   for (let line of lines) {
     const trimmed = line.trim();
-
     if (!trimmed) {
-      processedLines.push(line);
+      processed.push(line);
       continue;
     }
-
     if (trimmed.startsWith("#EXT-X-MEDIA:TYPE=AUDIO")) {
-      if (/mp4a\.6[9b]/i.test(trimmed)) {
-        line = line.replace(/mp4a\.6[9b]/gi, "mp4a.40.2");
-      }
-    }
-
-    if (trimmed.startsWith("#EXT-X-STREAM-INF:")) {
+      line = line.replace(/mp4a\.6[9b]/gi, "mp4a.40.2");
+    } else if (trimmed.startsWith("#EXT-X-STREAM-INF:")) {
       if (!trimmed.includes("CODECS=")) {
-        line = `${trimmed},CODECS="avc1.4d401f,mp4a.40.2"`;
+        line = `${trimmed},CODECS="${CONFIG.DEFAULT_VIDEO_CODEC}"`;
       } else {
         line = line.replace(/mp4a\.6[9b]/gi, "mp4a.40.2");
       }
-    }
-
-    if (!trimmed.startsWith("#")) {
+    } else if (!trimmed.startsWith("#")) {
       line = makeProxied(trimmed);
     }
-
-    processedLines.push(line);
+    processed.push(line);
   }
-
-  return processedLines.join("\n");
+  return processed.join("\n");
 }
 
-// ---------------------------------------------------------------------------
-// 3. Utilidades de caché y resiliencia
-// ---------------------------------------------------------------------------
-
-// Quita origin/referer/ua/user-agent de la URL destino (con o sin "?" / "&" delante)
-// para que la clave de caché sea idéntica pidan lo que pidan los clientes.
 function stripControlParams(url) {
   return url
     .replace(/([?&])(?:origin|referer|ua|user-agent)=[^&]*/gi, (_, sep) => (sep === "?" ? "?" : ""))
@@ -182,85 +180,62 @@ function stripControlParams(url) {
     .replace(/\?$/, "");
 }
 
-// Stream MPEG-TS continuo de Astra: UNA sola componente tras /play/ (ej. /play/a001).
-// Los segmentos HLS (/play/a001/123.ts) y los manifiestos NO entran aquí.
-function isContinuousTs(path) {
-  return /\/play\/[^/]+\/?$/.test(path);
-}
-
-function classify(path) {
-  if (path.endsWith(".m3u8") || path.endsWith(".mpd")) return "manifest";
-  if (isContinuousTs(path)) return "stream";
-  if (path.endsWith(".ts") || path.endsWith(".m4s") || path.endsWith(".aac")) return "segment";
-  return "other";
-}
-
-// Opciones de caché del edge de Cloudflare según el tipo de recurso
-function cfOptions(kind) {
-  if (kind === "segment") {
-    return {
-      cacheEverything: true,
-      // Los segmentos son inmutables. 404/5xx NO se cachean (en live un 404 suele
-      // significar "aún no existe" y debe poder reintentarse al instante).
-      cacheTtlByStatus: { "200-299": SEGMENT_TTL_S, "404": -1, "500-599": -1 },
-    };
-  }
-  if (kind === "manifest") {
-    // Micro-caché: N espectadores -> 1 petición/seg al origen por datacenter.
-    return {
-      cacheEverything: true,
-      cacheTtlByStatus: { "200-299": MANIFEST_TTL_S, "404": -1, "500-599": -1 },
-    };
-  }
-  return { cacheEverything: false };
-}
-
-// IP directa -> wildcard DNS (Cloudflare bloquea fetch a IPs)
 function toFetchUrl(urlStr) {
-  const host = new URL(urlStr).hostname;
-  return /^(\d{1,3}\.){3}\d{1,3}$/.test(host) ? urlStr.replace(host, `${host}.sslip.io`) : urlStr;
+  try {
+    const u = new URL(urlStr);
+    // Cloudflare no permite fetch directo a IPv4 puras si no tienen resolución de nombre
+    if (/^(\d{1,3}\.){3}\d{1,3}$/.test(u.hostname)) {
+      u.hostname = `${u.hostname}.sslip.io`;
+      return u.href;
+    }
+    return urlStr;
+  } catch (_) {
+    return urlStr;
+  }
 }
 
-// fetch con timeout (solo hasta recibir cabeceras) y reintentos con backoff
-async function fetchWithRetry(url, options, { retry404 = false } = {}) {
+async function fetchWithRetry(url, options) {
   const canRetry = options.method === "GET" || options.method === "HEAD";
-  const max = canRetry ? UPSTREAM_RETRIES : 0;
-  let lastErr;
+  const maxRetries = canRetry ? CONFIG.UPSTREAM_RETRIES : 0;
+  let lastError;
 
-  for (let i = 0; i <= max; i++) {
+  for (let i = 0; i <= maxRetries; i++) {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), UPSTREAM_TIMEOUT_MS);
+    const timeout = setTimeout(() => ctrl.abort(), CONFIG.UPSTREAM_TIMEOUT_MS);
     try {
       const res = await fetch(url, { ...options, signal: ctrl.signal });
-      clearTimeout(timer); // el cuerpo ya puede fluir sin que el timeout lo corte
-      const bad = res.status >= 500 || (retry404 && res.status === 404);
-      if (!bad || i === max) return res;
+      clearTimeout(timeout);
+      if (res.status < 500 || i === maxRetries) return res;
       res.body?.cancel();
     } catch (err) {
-      clearTimeout(timer);
-      lastErr = err;
-      if (i === max) throw err;
+      clearTimeout(timeout);
+      lastError = err;
+      if (i === maxRetries) throw err;
     }
     await new Promise((r) => setTimeout(r, 200 * (i + 1)));
   }
-  throw lastErr;
+  throw lastError;
 }
 
+// ---------------------------------------------------------------------------
+// 4. HANDLER PRINCIPAL
+// ---------------------------------------------------------------------------
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const reqOrigin = request.headers.get("Origin");
 
     const corsHeaders = {
       "Access-Control-Allow-Origin": reqOrigin || "*",
-      "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, OPTIONS",
+      "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
       "Access-Control-Allow-Headers": "*",
       "Access-Control-Allow-Credentials": "true",
+      "Access-Control-Max-Age": "86400", // Navegador recuerda el preflight por 24h
       "Access-Control-Expose-Headers": "Content-Length, Content-Range, Content-Type, Accept-Ranges, Date, Set-Cookie, X-Proxy-Cache",
       "Vary": "Origin",
     };
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders });
+      return new Response(null, { status: 204, headers: corsHeaders });
     }
 
     try {
@@ -270,15 +245,11 @@ export default {
         return new Response("OK", { status: 200, headers: corsHeaders });
       }
 
-      // 1+2. IDENTIDAD (origin/referer/ua) Y URL DESTINO
-      // Entradas aceptadas:
-      //   /i/<identidad>/<url>              (las generan los manifiestos reescritos)
-      //   /p/<url>?origin=&referer=&ua=
-      //   /?url=<url>&origin=&referer=&ua=
-      let identity;
+      // EXTRACCIÓN DE IDENTIDAD Y URL DESTINO
+      let identity = { o: null, r: null, u: null };
       let targetUrl = "";
-      const idMatch = reqUrl.pathname.match(/^\/i\/([A-Za-z0-9_-]+)\/(.+)$/);
 
+      const idMatch = reqUrl.pathname.match(/^\/i\/([A-Za-z0-9_-]+)\/(.+)$/);
       if (idMatch) {
         identity = decodeIdentity(idMatch[1]);
         targetUrl = (idMatch[2] + reqUrl.search).replace(/^(https?):\/+([^\/])/i, "$1://$2");
@@ -288,27 +259,21 @@ export default {
 
         if (reqUrl.pathname.startsWith("/p/")) {
           targetUrl = reqUrl.pathname.substring(3) + reqUrl.search;
-          // Corrección de barras duplicadas o reducidas
           targetUrl = targetUrl.replace(/^(https?):\/+([^\/])/i, "$1://$2");
         } else {
-          const rawUrl = request.url;
-          const urlMatches = rawUrl.match(/[?&]url=(.+)$/);
-          targetUrl = urlMatches ? urlMatches[1] : sp.get("url");
+          const match = request.url.match(/[?&]url=(.+)$/);
+          targetUrl = match ? match[1] : sp.get("url");
         }
-        // Los parámetros de control no deben llegar al origen ni a la clave de caché
+
         if (targetUrl) targetUrl = stripControlParams(targetUrl);
       }
 
       if (!targetUrl) {
-        return new Response("Falta el parámetro ?url= o la ruta /p/URL", {
+        return new Response("Uso: /p/URL o ?url=URL", {
           status: 400,
-          headers: corsHeaders,
+          headers: { ...corsHeaders, "Content-Type": "text/plain; charset=utf-8" },
         });
       }
-
-      const customOrigin = normalizeOrigin(identity.o);
-      const customReferer = identity.r || null;
-      const customUa = identity.u || null;
 
       try {
         if (targetUrl.includes("%3A") || targetUrl.includes("%2F")) {
@@ -321,64 +286,100 @@ export default {
       }
 
       const parsedTarget = new URL(targetUrl);
-      const fetchUrl = toFetchUrl(targetUrl);
+      const cleanPath = parsedTarget.pathname.toLowerCase();
+      const isManifest = /\.(m3u8|mpd)(\?|$)/i.test(cleanPath);
 
-      // 3. CABECERAS UPSTREAM (coherentes con el UA; sin Host: Cloudflare no permite
-      //    fijar un Host distinto al del destino, así que esa línea no hacía nada)
+      // ---------------------------------------------------------------------
+      // REVISIÓN DE MEMORIA RAM (Sólo para manifiestos)
+      // ---------------------------------------------------------------------
+      if (isManifest && request.method === "GET") {
+        const ramHit = getFromRam(targetUrl);
+        if (ramHit && !ramHit.isStale) {
+          return new Response(ramHit.data, {
+            status: 200,
+            headers: {
+              ...corsHeaders,
+              "Content-Type": ramHit.contentType,
+              "Cache-Control": "no-cache, no-store, must-revalidate",
+              "X-Proxy-Cache": "RAM-HIT",
+            },
+          });
+        }
+      }
+
+      // ---------------------------------------------------------------------
+      // REQUEST COALESCING (Evita saturar Astra si muchos piden lo mismo a la vez)
+      // ---------------------------------------------------------------------
+      if (isManifest && request.method === "GET" && IN_FLIGHT_REQUESTS.has(targetUrl)) {
+        try {
+          const pooled = await IN_FLIGHT_REQUESTS.get(targetUrl);
+          return new Response(pooled.data, {
+            status: 200,
+            headers: {
+              ...corsHeaders,
+              "Content-Type": pooled.contentType,
+              "Cache-Control": "no-cache, no-store, must-revalidate",
+              "X-Proxy-Cache": "POOLED-WAIT",
+            },
+          });
+        } catch (_) {}
+      }
+
       const upstreamHeaders = buildUpstreamHeaders({
         request,
         parsedTarget,
-        ua: customUa,
-        origin: customOrigin,
-        referer: customReferer,
-        chromeMajor: currentChromeMajor(env),
+        ua: identity.u,
+        origin: normalizeOrigin(identity.o),
+        referer: identity.r,
+        chromeMajor: getChromeMajor(env),
       });
-
-      // 4. FETCH AL ORIGEN (CACHÉ POR TIPO + REINTENTOS + STALE-IF-ERROR)
-      const cleanTarget = parsedTarget.pathname.toLowerCase();
-      const kind = classify(cleanTarget);
-
-      // Clave sintética donde guardamos el "último manifiesto bueno" (Cache API).
-      // OJO: la Cache API no funciona en *.workers.dev; necesita dominio propio/ruta.
-      const staleKey = new Request(`https://stale.proxy.internal/${encodeURIComponent(fetchUrl)}`);
 
       const fetchOptions = {
         method: request.method,
         headers: upstreamHeaders,
         redirect: "follow",
-        cf: cfOptions(kind),
       };
 
       if (request.method !== "GET" && request.method !== "HEAD") {
         fetchOptions.body = request.body;
       }
 
-      let res = null;
-      try {
-        res = await fetchWithRetry(fetchUrl, fetchOptions, { retry404: kind === "segment" });
-      } catch (_) {
-        res = null; // timeout / error de red tras agotar reintentos
+      // EJECUCIÓN CON RESILIENCIA Y SINGLE-FLIGHT REGISTRADO
+      let fetchPromise = fetchWithRetry(toFetchUrl(targetUrl), fetchOptions);
+      if (isManifest && request.method === "GET") {
+        IN_FLIGHT_REQUESTS.set(targetUrl, fetchPromise);
       }
 
-      // Origen caído: servimos el último manifiesto bueno (si es reciente) para que
-      // el reproductor siga consumiendo su buffer mientras el origen se recupera.
-      if ((!res || res.status >= 500) && request.method === "GET") {
-        const stale = await caches.default.match(staleKey);
-        if (stale) {
-          const age = Date.now() - Number(stale.headers.get("X-Cached-At") || 0);
-          if (age < STALE_MAX_MS) {
-            res?.body?.cancel();
-            const h = new Headers(stale.headers);
-            for (const [k, v] of Object.entries(corsHeaders)) h.set(k, v);
-            h.set("Cache-Control", "no-cache, no-store, must-revalidate");
-            h.set("X-Proxy-Cache", "STALE");
-            return new Response(stale.body, { status: 200, headers: h });
-          }
+      let res = null;
+      try {
+        res = await fetchPromise;
+      } catch (_) {
+        res = null;
+      } finally {
+        if (isManifest && request.method === "GET") {
+          IN_FLIGHT_REQUESTS.delete(targetUrl);
+        }
+      }
+
+      // STALE-FALLBACK: Si Astra dio error 5xx o timeout, pero tenemos versión previa en RAM
+      if ((!res || res.status >= 500) && isManifest && request.method === "GET") {
+        const ramStale = getFromRam(targetUrl);
+        if (ramStale) {
+          res?.body?.cancel();
+          return new Response(ramStale.data, {
+            status: 200,
+            headers: {
+              ...corsHeaders,
+              "Content-Type": ramStale.contentType,
+              "Cache-Control": "no-cache, no-store, must-revalidate",
+              "X-Proxy-Cache": "STALE-RAM-FALLBACK",
+            },
+          });
         }
       }
 
       if (!res) {
-        return new Response("Origen no disponible", {
+        return new Response("Astra o Stream no responde (Timeout o Conexión caída)", {
           status: 502,
           headers: { ...corsHeaders, "Content-Type": "text/plain; charset=utf-8" },
         });
@@ -386,9 +387,7 @@ export default {
 
       if (request.method === "HEAD") {
         const headHeaders = new Headers(res.headers);
-        for (const [k, v] of Object.entries(corsHeaders)) {
-          headHeaders.set(k, v);
-        }
+        for (const [k, v] of Object.entries(corsHeaders)) headHeaders.set(k, v);
         return new Response(null, { status: res.status, headers: headHeaders });
       }
 
@@ -400,19 +399,21 @@ export default {
         });
       }
 
-      // 5. HELPERS PARA RECONSTRUIR URLs RELATIVAS A TRAVÉS DEL PROXY
+      // RECONSTRUCCIÓN DE URLS RELATIVAS
       const baseUrl = new URL("./", parsedTarget).href;
-      const hasIdentity = customOrigin || customReferer || customUa;
-      const proxyPrefix = hasIdentity
-        ? `${reqUrl.origin}/i/${encodeIdentity({ o: customOrigin, r: customReferer, u: customUa })}/`
+      const hasId = identity.o || identity.r || identity.u;
+      const proxyPrefix = hasId
+        ? `${reqUrl.origin}/i/${encodeIdentity(identity)}/`
         : `${reqUrl.origin}/p/`;
-      const manifestSearchParams = parsedTarget.search;
 
-      // URL real (upstream) de una línea/URI del manifiesto
       function resolveUpstream(pathOrUrl) {
         const resolved = new URL(pathOrUrl.trim(), baseUrl);
-        if (!resolved.search && manifestSearchParams) {
-          resolved.search = manifestSearchParams;
+        if (parsedTarget.searchParams) {
+          for (const [k, v] of parsedTarget.searchParams.entries()) {
+            if (!resolved.searchParams.has(k)) {
+              resolved.searchParams.set(k, v);
+            }
+          }
         }
         return resolved;
       }
@@ -421,162 +422,103 @@ export default {
         const trimmed = pathOrUrl.trim();
         if (!trimmed) return "";
         try {
-          const resolved = resolveUpstream(trimmed);
-          return `${proxyPrefix}${resolved.href}`;
+          return `${proxyPrefix}${resolveUpstream(trimmed).href}`;
         } catch (_) {
           return `${proxyPrefix}${trimmed}`;
         }
       }
 
-      // Guarda el último manifiesto bueno (ya reescrito) para el fallback stale-if-error
-      function rememberManifest(text, contentType) {
-        ctx.waitUntil(
-          caches.default
-            .put(
-              staleKey,
-              new Response(text, {
-                headers: {
-                  "Content-Type": contentType,
-                  "Cache-Control": "public, max-age=120",
-                  "X-Cached-At": String(Date.now()),
-                },
-              })
-            )
-            .catch(() => {})
-        );
-      }
-
-      // Precalienta en el edge los últimos segmentos del manifiesto, de modo que
-      // incluso el primer espectador los reciba desde caché.
-      function prefetchSegments(manifestText) {
-        if (!PREFETCH_COUNT) return;
-        const uris = manifestText
-          .split("\n")
-          .map((l) => l.trim())
-          .filter((l) => l && !l.startsWith("#") && !/\.(m3u8|mpd)(\?|$)/i.test(l))
-          .slice(-PREFETCH_COUNT);
-
-        const prefetchHeaders = new Headers(upstreamHeaders);
-        prefetchHeaders.delete("range");
-
-        for (const uri of uris) {
-          try {
-            const target = resolveUpstream(uri).href;
-            ctx.waitUntil(
-              fetch(toFetchUrl(target), {
-                headers: prefetchHeaders,
-                redirect: "follow",
-                cf: cfOptions("segment"),
-              })
-                // Hay que CONSUMIR el cuerpo para que el edge complete el guardado en caché
-                .then((r) => (r.ok ? r.arrayBuffer() : r.body?.cancel()))
-                .catch(() => {})
-            );
-          } catch (_) {}
-        }
-      }
-
-      // 6. DETECCIÓN DE CONTENIDO
-      const rawContentType = (res.headers.get("content-type") || "").toLowerCase();
-
-      let isHls = cleanTarget.endsWith(".m3u8") || rawContentType.includes("mpegurl");
-      let isDash = cleanTarget.endsWith(".mpd") || rawContentType.includes("dash+xml");
-
-      let responseText = null;
-      if (!isHls && !isDash && (rawContentType.includes("xml") || rawContentType.includes("text") || cleanTarget.includes("manifest"))) {
-        responseText = await res.text();
-        if (responseText.includes("#EXTM3U")) {
-          isHls = true;
-        } else if (responseText.includes("<MPD") || responseText.includes("<mpd")) {
-          isDash = true;
-        }
-      }
-
-      function createResponseHeaders(defaultContentType) {
+      // PREPARACIÓN DE CABECERAS PARA MANIFIESTOS (Elimina compresión vieja)
+      function cleanManifestHeaders(contentType) {
         const h = new Headers(res.headers);
-        for (const [k, v] of Object.entries(corsHeaders)) {
-          h.set(k, v);
-        }
-        if (defaultContentType) {
-          h.set("Content-Type", defaultContentType);
-        }
-        if (typeof res.headers.getSetCookie === "function") {
-          const cookies = res.headers.getSetCookie();
-          for (const cookie of cookies) {
-            h.append("Set-Cookie", cookie);
-          }
-        }
+        for (const [k, v] of Object.entries(corsHeaders)) h.set(k, v);
+        h.delete("Content-Encoding");
+        h.delete("Content-Length");
+        h.delete("Transfer-Encoding");
+        h.set("Content-Type", contentType);
+        h.set("Cache-Control", "no-cache, no-store, must-revalidate");
         return h;
       }
 
-      // CASO A: HLS (.m3u8) CON ADAPTADOR CESBO ASTRA
-      if (isHls) {
-        const original = responseText !== null ? responseText : await res.text();
-        const text = patchAstraHlsManifest(original, makeProxied);
+      // DETECCIÓN DE CONTENIDO
+      const rawContentType = (res.headers.get("content-type") || "").toLowerCase();
+      let isHls = cleanPath.endsWith(".m3u8") || rawContentType.includes("mpegurl");
+      let isDash = cleanPath.endsWith(".mpd") || rawContentType.includes("dash+xml");
 
-        if (request.method === "GET" && res.status === 200) {
-          rememberManifest(text, "application/vnd.apple.mpegurl; charset=utf-8");
-          // Solo precalentamos cuando el manifiesto es nuevo (no un HIT de la micro-caché)
-          if (res.headers.get("cf-cache-status") !== "HIT") prefetchSegments(original);
-        }
-
-        const hlsHeaders = createResponseHeaders("application/vnd.apple.mpegurl; charset=utf-8");
-        hlsHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate");
-
-        return new Response(text, { status: res.status, headers: hlsHeaders });
+      let responseText = null;
+      if (!isHls && !isDash && (rawContentType.includes("text") || rawContentType.includes("xml"))) {
+        responseText = await res.text();
+        if (responseText.includes("#EXTM3U")) isHls = true;
+        else if (responseText.includes("<MPD") || responseText.includes("<mpd")) isDash = true;
       }
 
-      // CASO B: MPEG-DASH (.mpd)
+      // PROCESAMIENTO HLS
+      if (isHls) {
+        const originalText = responseText !== null ? responseText : await res.text();
+        const patchedText = patchAstraHlsManifest(originalText, makeProxied);
+        const cType = "application/vnd.apple.mpegurl; charset=utf-8";
+
+        if (request.method === "GET" && res.status === 200) {
+          saveToRam(targetUrl, patchedText, cType);
+        }
+
+        return new Response(patchedText, {
+          status: res.status,
+          headers: cleanManifestHeaders(cType),
+        });
+      }
+
+      // PROCESAMIENTO DASH
       if (isDash) {
-        let text = responseText !== null ? responseText : await res.text();
+        let originalText = responseText !== null ? responseText : await res.text();
         const proxiedBase = `<BaseURL>${proxyPrefix}${baseUrl}</BaseURL>`;
 
-        if (/<BaseURL[^>]*>/i.test(text)) {
-          text = text.replace(/<BaseURL[^>]*>([^<]+)<\/BaseURL>/gi, (m, p1) => `<BaseURL>${makeProxied(p1)}</BaseURL>`);
+        if (/<BaseURL[^>]*>/i.test(originalText)) {
+          originalText = originalText.replace(
+            /<BaseURL[^>]*>([^<]+)<\/BaseURL>/gi,
+            (_, uri) => `<BaseURL>${makeProxied(uri)}</BaseURL>`
+          );
         } else {
-          text = text.replace(/<MPD([^>]*)>/i, `<MPD$1>\n  ${proxiedBase}`);
+          originalText = originalText.replace(/<MPD([^>]*)>/i, `<MPD$1>\n  ${proxiedBase}`);
         }
 
+        const cType = "application/dash+xml; charset=utf-8";
         if (request.method === "GET" && res.status === 200) {
-          rememberManifest(text, "application/dash+xml; charset=utf-8");
+          saveToRam(targetUrl, originalText, cType);
         }
 
-        const dashHeaders = createResponseHeaders("application/dash+xml; charset=utf-8");
-        dashHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate");
-
-        return new Response(text, { status: res.status, headers: dashHeaders });
+        return new Response(originalText, {
+          status: res.status,
+          headers: cleanManifestHeaders(cType),
+        });
       }
 
-      // CASO C: SEGMENTOS BINARIOS (.ts, .m4s) O STREAM CONTINUO MPEG-TS DIRECTO DE ASTRA
-      const binaryHeaders = createResponseHeaders();
+      // SEGMENTOS (.TS / .M4S) O STREAM CONTINUO (ZERO-BUFFERING PASS-THROUGH)
+      const binaryHeaders = new Headers(res.headers);
+      for (const [k, v] of Object.entries(corsHeaders)) binaryHeaders.set(k, v);
 
-      const cacheStatus = res.headers.get("cf-cache-status");
-      if (cacheStatus) binaryHeaders.set("X-Proxy-Cache", cacheStatus);
-
-      if (kind === "stream") {
-        // Stream continuo: jamás cacheable
+      if (cleanPath.endsWith(".ts") || /\/play\/[^/]+\/?$/.test(cleanPath)) {
         binaryHeaders.set("Content-Type", "video/mp2t");
-        binaryHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate");
-      } else if (cleanTarget.endsWith(".ts")) {
-        binaryHeaders.set("Content-Type", "video/mp2t");
-        binaryHeaders.set("Cache-Control", `public, max-age=${SEGMENT_TTL_S}`);
-      } else if (cleanTarget.endsWith(".m4s")) {
+      } else if (cleanPath.endsWith(".m4s")) {
         binaryHeaders.set("Content-Type", "video/iso.segment");
-        binaryHeaders.set("Cache-Control", `public, max-age=${SEGMENT_TTL_S}`);
-      } else if (rawContentType.includes("mp2t") || rawContentType.includes("octet-stream")) {
-        binaryHeaders.set("Content-Type", "video/mp2t");
-        binaryHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate");
       }
 
+      if (typeof res.headers.getSetCookie === "function") {
+        for (const cookie of res.headers.getSetCookie()) {
+          binaryHeaders.append("Set-Cookie", cookie);
+        }
+      }
+
+      // El body fluye directamente por tubería sin gastar RAM ni tiempo de CPU
       return new Response(res.body, {
         status: res.status,
         headers: binaryHeaders,
       });
 
     } catch (err) {
-      return new Response("Error al procesar stream: " + err.message, {
+      return new Response("Error Proxy: " + err.message, {
         status: 500,
-        headers: corsHeaders,
+        headers: { ...corsHeaders, "Content-Type": "text/plain; charset=utf-8" },
       });
     }
   },
