@@ -529,7 +529,10 @@ export default {
       }
 
       const allowCookies = kind === "other";
-      const binaryHeaders = createResponseHeaders(null, { allowCookies });
+      const binaryHeaders = createResponseHeaders(null, {
+        allowCookies,
+        stripEncoding: responseText !== null,
+      });
 
       if (kind === "stream") {
         binaryHeaders.set("Content-Type", "video/mp2t");
@@ -550,7 +553,7 @@ export default {
         binaryHeaders.set("Vercel-CDN-Cache-Control", "no-store");
       }
 
-      return new Response(res.body, {
+      return new Response(responseText !== null ? responseText : res.body, {
         status: res.status,
         headers: binaryHeaders,
       });
