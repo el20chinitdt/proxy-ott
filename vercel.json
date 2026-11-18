@@ -1,5 +1,14 @@
 {
-  "routes": [
-    { "src": "/(.*)", "dest": "/api/proxy" }
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/proxy.js": {
+      "maxDuration": 300
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/:path*",
+      "destination": "/api/proxy?__vpath=/:path*"
+    }
   ]
 }
