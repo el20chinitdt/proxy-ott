@@ -1,5 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "regions": ["gru1"],
   "functions": {
     "api/proxy.js": {
       "maxDuration": 300
@@ -11,7 +12,7 @@
       "destination": "/api/proxy?__vpath=/"
     },
     {
-      "source": "/((?!api/proxy(?:/|$)).*)",
+      "source": "/((?!api/proxy).*)",
       "destination": "/api/proxy?__vpath=/$1"
     }
   ]
