@@ -1,6 +1,6 @@
 // ============================================================================
 // VERCEL SERVERLESS FUNCTION: CORS PROXY + ADAPTADOR PARA CESBO ASTRA & HLS/DASH
-// Adaptado desde el Cloudflare Worker original
+// Versión corregida para compatibilidad de headers en Vercel
 // ============================================================================
 
 const SEGMENT_TTL_S = 60;
@@ -171,6 +171,15 @@ async function fetchWithRetry(url, options, { retry404 = false } = {}) {
 }
 
 export default async function handler(request) {
+  // Parche de compatibilidad de headers para Node.js / Vercel
+  if (request.headers && typeof request.headers.get !== "function") {
+    const rawHeaders = request.headers;
+    request.headers = {
+      get: (h) => rawHeaders[h.toLowerCase()] || null,
+      has: (h) => !!rawHeaders[h.toLowerCase()],
+    };
+  }
+
   const reqUrl = new URL(request.url, `https://${request.headers.get("host")}`);
   const reqOrigin = request.headers.get("Origin");
 
@@ -195,7 +204,6 @@ export default async function handler(request) {
     let identity;
     let targetUrl = "";
     
-    // Soporte para ruta limpia de Vercel (/api/proxy/i/... o manejando reqUrl)
     const relativePath = reqUrl.pathname.replace(/^\/api\/proxy/, "");
     const idMatch = relativePath.match(/^\/i\/([A-Za-z0-9_-]+)\/(.+)$/);
 
