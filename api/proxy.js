@@ -1,6 +1,5 @@
 // ============================================================================
 // VERCEL FUNCTION: CORS PROXY + ADAPTADOR PARA CESBO ASTRA & HLS/DASH
-// Sin dependencias externas - listo para deploy directo desde GitHub
 // ============================================================================
 
 const SEGMENT_TTL_S = 60;
@@ -9,7 +8,7 @@ const STALE_MAX_MS = 30000;
 const STALE_MAX_S = Math.floor(STALE_MAX_MS / 1000);
 const UPSTREAM_TIMEOUT_MS = 6000;
 const UPSTREAM_RETRIES = 2;
-const PREFETCH_COUNT = 0; // En Vercel conviene en 0 (si lo activas consume invocaciones extra)
+const PREFETCH_COUNT = 0;
 const USE_SSLIP_IO = process.env.USE_SSLIP_IO === "1";
 
 const staleManifestCache = new Map();
@@ -210,18 +209,28 @@ async function fetchWithRetry(url, options, { retry404 = false } = {}) {
 export default {
   async fetch(request) {
     const reqOrigin = request.headers.get("Origin");
+    const reqHeaders = request.headers.get("Access-Control-Request-Headers");
+    const hasValidOrigin = Boolean(reqOrigin && reqOrigin !== "null");
 
     const corsHeaders = {
-      "Access-Control-Allow-Origin": reqOrigin || "*",
+      "Access-Control-Allow-Origin": hasValidOrigin ? reqOrigin : "*",
       "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, OPTIONS",
-      "Access-Control-Allow-Headers": "*",
-      "Access-Control-Allow-Credentials": "true",
+      "Access-Control-Allow-Headers": reqHeaders || "*",
       "Access-Control-Expose-Headers": "Content-Length, Content-Range, Content-Type, Accept-Ranges, Date, Set-Cookie, X-Proxy-Cache",
       "Vary": "Origin",
     };
+    if (hasValidOrigin) {
+      corsHeaders["Access-Control-Allow-Credentials"] = "true";
+    }
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders });
+      return new Response(null, {
+        status: 204,
+        headers: {
+          ...corsHeaders,
+          "Access-Control-Max-Age": "86400",
+        },
+      });
     }
 
     try {
@@ -342,6 +351,9 @@ export default {
 
       if (request.method === "HEAD") {
         const headHeaders = new Headers(res.headers);
+        headHeaders.delete("connection");
+        headHeaders.delete("keep-alive");
+        headHeaders.delete("transfer-encoding");
         for (const [k, v] of Object.entries(corsHeaders)) {
           headHeaders.set(k, v);
         }
@@ -437,6 +449,10 @@ export default {
 
       function createResponseHeaders(defaultContentType, { allowCookies = false, stripEncoding = false } = {}) {
         const h = new Headers(res.headers);
+        h.delete("connection");
+        h.delete("keep-alive");
+        h.delete("transfer-encoding");
+
         if (!allowCookies) {
           h.delete("set-cookie");
         } else if (typeof res.headers.getSetCookie === "function") {
