@@ -11,7 +11,7 @@ const MANIFEST_TTL_S = 1;       // micro-caché del manifiesto live (≤ 1/2 dur
 const STALE_MAX_MS = 30000;     // cuánto tiempo servir el último manifiesto bueno si el origen cae
 const UPSTREAM_TIMEOUT_MS = 6000; // ms máximos para recibir cabeceras del origen
 const UPSTREAM_RETRIES = 2;     // reintentos ante 5xx / timeout / (404 en segmentos)
-const PREFETCH_COUNT = 2;       // últimos N segmentos del manifiesto que se precalientan (0 = off)
+const PREFETCH_COUNT = 2;       // últimos N segmentos del manifiesto que se precalientan (bajar a 1 o 0 si hay límite de subrequests o latencia extra)
 
 // 1. Identidad de navegador COHERENTE (UA + Client Hints + Sec-Fetch-*)
 
@@ -170,8 +170,9 @@ function patchAstraHlsManifest(text, makeProxied) {
 }
 
 // Adaptador de <BaseURL> en manifiestos MPEG-DASH (.mpd):
-// soporta etiquetas vacías (<BaseURL/>, <BaseURL></BaseURL>), atributos y múltiples
-// ocurrencias anidadas (<MPD>, <Period>, <AdaptationSet>, <Representation>, etc.).
+// conserva intactas las etiquetas vacías (<BaseURL/>, <BaseURL></BaseURL>),
+// preserva atributos, resuelve múltiples ocurrencias anidadas según su padre
+// e inyecta el <BaseURL> del proxy en <MPD> si no existe ninguno no vacío en <MPD>.
 function patchDashManifest(text, { baseUrl, manifestSearchParams, proxyPrefix }) {
   const escapeXml = (s) => s.replace(/&/g, "&amp;");
   const decodeXml = (s) => s.replace(/&amp;/g, "&");
@@ -191,9 +192,13 @@ function patchDashManifest(text, { baseUrl, manifestSearchParams, proxyPrefix })
         const parentBase = top ? top.parentBase : baseUrl;
 
         const trimmed = decodeXml(rawContent.trim());
+        if (!trimmed) {
+          return full;
+        }
+
         let proxied;
         try {
-          const resolved = trimmed ? new URL(trimmed, parentBase) : new URL(parentBase);
+          const resolved = new URL(trimmed, parentBase);
           if (!resolved.search && manifestSearchParams) {
             resolved.search = manifestSearchParams;
           }
@@ -203,7 +208,7 @@ function patchDashManifest(text, { baseUrl, manifestSearchParams, proxyPrefix })
           }
           proxied = `${proxyPrefix}${resolved.href}`;
         } catch (_) {
-          proxied = `${proxyPrefix}${trimmed || parentBase}`;
+          proxied = `${proxyPrefix}${trimmed}`;
         }
 
         if (top && top.tagLower === "mpd") {
@@ -335,9 +340,10 @@ export default {
       "Access-Control-Allow-Origin": hasExplicitOrigin ? reqOrigin : "*",
       "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, OPTIONS",
       "Access-Control-Allow-Headers": "*",
-      ...(hasExplicitOrigin ? { "Access-Control-Allow-Credentials": "true" } : {}),
+      ...(hasExplicitOrigin
+        ? { "Access-Control-Allow-Credentials": "true", "Vary": "Origin" }
+        : {}),
       "Access-Control-Expose-Headers": "Content-Length, Content-Range, Content-Type, Accept-Ranges, Date, Set-Cookie, X-Proxy-Cache",
-      "Vary": "Origin",
     };
 
     if (request.method === "OPTIONS") {
