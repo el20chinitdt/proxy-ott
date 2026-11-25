@@ -11,7 +11,7 @@ const MANIFEST_TTL_S = 1;       // micro-caché del manifiesto live (≤ 1/2 dur
 const STALE_MAX_MS = 30000;     // cuánto tiempo servir el último manifiesto bueno si el origen cae
 const UPSTREAM_TIMEOUT_MS = 6000; // ms máximos para recibir cabeceras del origen
 const UPSTREAM_RETRIES = 2;     // reintentos ante 5xx / timeout / (404 en segmentos)
-const PREFETCH_COUNT = 2;       // últimos N segmentos del manifiesto que se precalientan (bajar a 1 o 0 si hay límite de subrequests o latencia extra)
+const PREFETCH_COUNT = 2;       // últimos N segmentos del manifiesto que se precalientan (0 = off)
 
 // 1. Identidad de navegador COHERENTE (UA + Client Hints + Sec-Fetch-*)
 
@@ -169,91 +169,6 @@ function patchAstraHlsManifest(text, makeProxied) {
   return processedLines.join("\n");
 }
 
-// Adaptador de <BaseURL> en manifiestos MPEG-DASH (.mpd):
-// conserva intactas las etiquetas vacías (<BaseURL/>, <BaseURL></BaseURL>),
-// preserva atributos, resuelve múltiples ocurrencias anidadas según su padre
-// e inyecta el <BaseURL> del proxy en <MPD> si no existe ninguno no vacío en <MPD>.
-function patchDashManifest(text, { baseUrl, manifestSearchParams, proxyPrefix }) {
-  const escapeXml = (s) => s.replace(/&/g, "&amp;");
-  const decodeXml = (s) => s.replace(/&amp;/g, "&");
-
-  const stack = [];
-  let mpdHasDirectBaseUrl = false;
-
-  const xmlTokenRe = /<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\?[\s\S]*?\?>|<!DOCTYPE[\s\S]*?>|<BaseURL\b((?:[^>"'/]|\/(?!>)|"[^"]*"|'[^']*')*)\/>|<BaseURL\b((?:[^>"'/]|\/(?!>)|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/BaseURL>|<(\/?)([A-Za-z_][\w:.-]*)((?:[^>"'/]|\/(?!>)|"[^"]*"|'[^']*')*)(\/?)>/gi;
-
-  let patched = text.replace(
-    xmlTokenRe,
-    (full, scAttrs, openAttrs, innerText, closeSlash, tagName, tagAttrs, selfClose) => {
-      if (scAttrs !== undefined || openAttrs !== undefined) {
-        const rawAttrs = scAttrs !== undefined ? scAttrs.replace(/\s+$/, "") : openAttrs;
-        const rawContent = innerText !== undefined ? innerText : "";
-        const top = stack[stack.length - 1];
-        const parentBase = top ? top.parentBase : baseUrl;
-
-        const trimmed = decodeXml(rawContent.trim());
-        if (!trimmed) {
-          return full;
-        }
-
-        let proxied;
-        try {
-          const resolved = new URL(trimmed, parentBase);
-          if (!resolved.search && manifestSearchParams) {
-            resolved.search = manifestSearchParams;
-          }
-          if (top && !top.hasDirectBaseUrl) {
-            top.hasDirectBaseUrl = true;
-            top.effectiveBase = resolved.href;
-          }
-          proxied = `${proxyPrefix}${resolved.href}`;
-        } catch (_) {
-          proxied = `${proxyPrefix}${trimmed}`;
-        }
-
-        if (top && top.tagLower === "mpd") {
-          mpdHasDirectBaseUrl = true;
-        }
-
-        return `<BaseURL${rawAttrs}>${escapeXml(proxied)}</BaseURL>`;
-      }
-
-      if (tagName) {
-        const tagLower = tagName.toLowerCase();
-        if (closeSlash) {
-          for (let i = stack.length - 1; i >= 0; i--) {
-            if (stack[i].tagLower === tagLower) {
-              stack.length = i;
-              break;
-            }
-          }
-        } else if (!selfClose) {
-          const parentEffective = stack.length ? stack[stack.length - 1].effectiveBase : baseUrl;
-          stack.push({
-            tagLower,
-            parentBase: parentEffective,
-            effectiveBase: parentEffective,
-            hasDirectBaseUrl: false,
-          });
-        }
-        return full;
-      }
-
-      return full;
-    }
-  );
-
-  if (!mpdHasDirectBaseUrl) {
-    const proxiedBase = `<BaseURL>${escapeXml(`${proxyPrefix}${baseUrl}`)}</BaseURL>`;
-    patched = patched.replace(
-      /<MPD\b((?:[^>"'/]|\/(?!>)|"[^"]*"|'[^']*')*)>/i,
-      `<MPD$1>\n  ${proxiedBase}`
-    );
-  }
-
-  return patched;
-}
-
 // ---------------------------------------------------------------------------
 // 3. Utilidades de caché y resiliencia
 // ---------------------------------------------------------------------------
@@ -334,25 +249,18 @@ async function fetchWithRetry(url, options, { retry404 = false } = {}) {
 export default {
   async fetch(request, env, ctx) {
     const reqOrigin = request.headers.get("Origin");
-    const hasExplicitOrigin = Boolean(reqOrigin && reqOrigin !== "null");
 
     const corsHeaders = {
-      "Access-Control-Allow-Origin": hasExplicitOrigin ? reqOrigin : "*",
+      "Access-Control-Allow-Origin": reqOrigin || "*",
       "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, OPTIONS",
       "Access-Control-Allow-Headers": "*",
-      ...(hasExplicitOrigin
-        ? { "Access-Control-Allow-Credentials": "true", "Vary": "Origin" }
-        : {}),
+      "Access-Control-Allow-Credentials": "true",
       "Access-Control-Expose-Headers": "Content-Length, Content-Range, Content-Type, Accept-Ranges, Date, Set-Cookie, X-Proxy-Cache",
+      "Vary": "Origin",
     };
 
     if (request.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          ...corsHeaders,
-          "Access-Control-Max-Age": "86400",
-        },
-      });
+      return new Response(null, { headers: corsHeaders });
     }
 
     try {
@@ -430,11 +338,9 @@ export default {
       const cleanTarget = parsedTarget.pathname.toLowerCase();
       const kind = classify(cleanTarget);
 
-      // Clave sintética dentro del mismo origen del Worker para caches.default.
+      // Clave sintética donde guardamos el "último manifiesto bueno" (Cache API).
       // OJO: la Cache API no funciona en *.workers.dev; necesita dominio propio/ruta.
-      const staleKey = new Request(
-        new URL(`/__stale/${encodeURIComponent(fetchUrl)}`, reqUrl.origin).href
-      );
+      const staleKey = new Request(`https://stale.proxy.internal/${encodeURIComponent(fetchUrl)}`);
 
       const fetchOptions = {
         method: request.method,
@@ -464,7 +370,6 @@ export default {
             res?.body?.cancel();
             const h = new Headers(stale.headers);
             for (const [k, v] of Object.entries(corsHeaders)) h.set(k, v);
-            if (!hasExplicitOrigin) h.delete("Access-Control-Allow-Credentials");
             h.set("Cache-Control", "no-cache, no-store, must-revalidate");
             h.set("X-Proxy-Cache", "STALE");
             return new Response(stale.body, { status: 200, headers: h });
@@ -483,9 +388,6 @@ export default {
         const headHeaders = new Headers(res.headers);
         for (const [k, v] of Object.entries(corsHeaders)) {
           headHeaders.set(k, v);
-        }
-        if (!hasExplicitOrigin) {
-          headHeaders.delete("Access-Control-Allow-Credentials");
         }
         return new Response(null, { status: res.status, headers: headHeaders });
       }
@@ -595,9 +497,6 @@ export default {
         for (const [k, v] of Object.entries(corsHeaders)) {
           h.set(k, v);
         }
-        if (!hasExplicitOrigin) {
-          h.delete("Access-Control-Allow-Credentials");
-        }
         if (defaultContentType) {
           h.set("Content-Type", defaultContentType);
         }
@@ -629,12 +528,14 @@ export default {
 
       // CASO B: MPEG-DASH (.mpd)
       if (isDash) {
-        const rawDash = responseText !== null ? responseText : await res.text();
-        const text = patchDashManifest(rawDash, {
-          baseUrl,
-          manifestSearchParams,
-          proxyPrefix,
-        });
+        let text = responseText !== null ? responseText : await res.text();
+        const proxiedBase = `<BaseURL>${proxyPrefix}${baseUrl}</BaseURL>`;
+
+        if (/<BaseURL[^>]*>/i.test(text)) {
+          text = text.replace(/<BaseURL[^>]*>([^<]+)<\/BaseURL>/gi, (m, p1) => `<BaseURL>${makeProxied(p1)}</BaseURL>`);
+        } else {
+          text = text.replace(/<MPD([^>]*)>/i, `<MPD$1>\n  ${proxiedBase}`);
+        }
 
         if (request.method === "GET" && res.status === 200) {
           rememberManifest(text, "application/dash+xml; charset=utf-8");
