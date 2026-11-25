@@ -1,33 +1,28 @@
 // ============================================================================
 // CLOUDFLARE WORKER: CORS PROXY + ADAPTADOR PARA CESBO ASTRA & HLS/DASH
-// Blindado automáticamente contra bajas de velocidad, throttling y stalls
 // ============================================================================
 
-// ---------------------------------------------------------------------------
-// CONFIGURACIÓN DE CACHÉ, RESILIENCIA Y ANTI-THROTTLING
-// ---------------------------------------------------------------------------
-const SEGMENT_TTL_S = 60;              // vida de un segmento en el edge
-const MANIFEST_TTL_S = 1;              // micro-caché del manifiesto live
-const STALE_MAX_MS = 30000;            // cuánto tiempo servir el último manifiesto bueno si cae el origen
-const UPSTREAM_TIMEOUT_MS = 6000;      // ms máximos para recibir cabeceras del origen
-const HEDGE_DELAY_MS = 1200;           // si tarda >1.2s en cabeceras, lanza petición paralela de respaldo
-const UPSTREAM_RETRIES = 2;            // reintentos ante 5xx / 429 / timeout / (404 en segmentos)
-const PREFETCH_COUNT = 2;              // últimos N segmentos del manifiesto que se precalientan (0 = off)
+const SEGMENT_TTL_S = 60;
+const MANIFEST_TTL_S = 1;
+const STALE_MAX_MS = 30000;
+const UPSTREAM_TIMEOUT_MS = 12000;
+const UPSTREAM_RETRIES = 2;
+const MAX_REDIRECTS = 5;
+const PREFETCH_COUNT = 2;
 
-const STALL_TIMEOUT_MS = 3000;         // si un segmento/archivo deja de enviar bytes 3s -> reanuda/escala
-const STREAM_IDLE_TIMEOUT_MS = 15000;  // watchdog de inactividad para streams TS continuos
-const THROTTLE_GRACE_MS = 600;         // gracia inicial antes de evaluar caída de velocidad
-const THROTTLE_FLOOR_BPS = 350 * 1024; // < 350 KB/s -> escala a Multi-Range paralelo
-const MULTI_RANGE_MIN_REMAINING = 256 * 1024; // mínimo restante para dividir en Multi-Range
-const MULTI_RANGE_CONCURRENCY = 4;     // conexiones paralelas (máximo permitido en CF = 6)
-const MULTI_CHUNK_BYTES = 512 * 1024;  // tamaño base de chunk (512 KB)
-const MAX_CHUNKS_PER_REQ = 24;         // tope de chunks por petición (seguro bajo límite de subrequests CF)
-const MAX_RESUME_ATTEMPTS = 3;         // reintentos de reanudación ante cortes/stalls
-const MAX_CACHEABLE_BYTES = 24 * 1024 * 1024; // 24 MB (seguro bajo límite de ~128 MB de tee())
-const THROTTLED_HOST_TTL_MS = 120000;  // memoria por isolate: 2 min recordando CDNs que caparon velocidad
-const NO_RANGE_HOST_TTL_MS = 600000;   // 10 min recordando orígenes que ignoran Range
+const STALL_TIMEOUT_MS = 3500;
+const STREAM_IDLE_TIMEOUT_MS = 15000;
+const THROTTLE_GRACE_MS = 600;
+const THROTTLE_FLOOR_BPS = 350 * 1024;
+const MULTI_RANGE_MIN_REMAINING = 256 * 1024;
+const MULTI_RANGE_CONCURRENCY = 3;
+const MULTI_CHUNK_BYTES = 512 * 1024;
+const MAX_CHUNKS_PER_REQ = 24;
+const MAX_RESUME_ATTEMPTS = 3;
+const MAX_CACHEABLE_BYTES = 24 * 1024 * 1024;
+const THROTTLED_HOST_TTL_MS = 120000;
+const NO_RANGE_HOST_TTL_MS = 600000;
 
-// Memoria ligera por isolate para acelerar automáticamente CDNs lentas desde el byte 0
 const throttledHosts = new Map();
 const noRangeHosts = new Map();
 
@@ -50,7 +45,7 @@ function hasValidTtl(map, key) {
 }
 
 // ---------------------------------------------------------------------------
-// 1. IDENTIDAD DE NAVEGADOR COHERENTE (UA + Client Hints + Sec-Fetch-*)
+// 1. IDENTIDAD DE NAVEGADOR COHERENTE
 // ---------------------------------------------------------------------------
 function currentChromeMajor(env) {
   const fromEnv = parseInt(env && env.CHROME_MAJOR, 10);
@@ -169,7 +164,7 @@ function buildUpstreamHeaders({ request, parsedTarget, ua, origin, referer, chro
 }
 
 // ---------------------------------------------------------------------------
-// 2. ADAPTADOR Y SANEADOR DE MANIFIESTOS HLS (CESBO ASTRA)
+// 2. ADAPTADOR HLS (CESBO ASTRA) & XML
 // ---------------------------------------------------------------------------
 function patchAstraHlsManifest(text, makeProxied) {
   const patched = text.replace(/URI="([^"]+)"/g, (_, uri) => `URI="${makeProxied(uri)}"`);
@@ -201,6 +196,10 @@ function patchAstraHlsManifest(text, makeProxied) {
   }
 
   return processedLines.join("\n");
+}
+
+function escapeXmlText(str) {
+  return str.replace(/&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-f]+);)/gi, "&amp;");
 }
 
 // ---------------------------------------------------------------------------
@@ -261,9 +260,13 @@ function cfOptions(kind) {
   return { cacheEverything: false };
 }
 
-function toFetchUrl(urlStr) {
+function toFetchUrl(urlStr, wildcard = "sslip.io") {
   const host = new URL(urlStr).hostname;
-  return /^(\d{1,3}\.){3}\d{1,3}$/.test(host) ? urlStr.replace(host, `${host}.sslip.io`) : urlStr;
+  return /^(\d{1,3}\.){3}\d{1,3}$/.test(host) ? urlStr.replace(host, `${host}.${wildcard}`) : urlStr;
+}
+
+function swapWildcardHost(urlStr) {
+  return urlStr.includes(".sslip.io") ? urlStr.replace(".sslip.io", ".nip.io") : urlStr;
 }
 
 function cleanCacheHeaders(headers, ttlSeconds) {
@@ -302,11 +305,8 @@ function sleep(ms) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. MOTOR DE RED RESILIENTE (HEDGING + RETRIES + MULTI-RANGE ANTI-THROTTLE)
+// 4. MOTOR DE RED RESILIENTE (REDIRECCIONES SEGURAS + RETRIES + MULTI-RANGE)
 // ---------------------------------------------------------------------------
-
-// Lee el cuerpo completo de un chunk con timeout por INACTIVIDAD (no por duración total),
-// evitando falsos timeouts si la CDN va lenta pero progresando, y cortando al instante si se congela.
 async function readBytesWithStallTimeout(body, expectedLen, stallMs, ctrl) {
   const reader = body.getReader();
   const chunks = [];
@@ -349,143 +349,153 @@ async function readBytesWithStallTimeout(body, expectedLen, stallMs, ctrl) {
   return out;
 }
 
-// Petición con timeout en cabeceras + Hedged Request si el origen tarda en responder.
-// Devuelve { res, hedged, activeCtrl } para que el stream pueda abortar el socket si se congela después.
-async function fetchWithHedge(url, options, { hedgeDelayMs = HEDGE_DELAY_MS, timeoutMs = UPSTREAM_TIMEOUT_MS } = {}) {
-  const canHedge = hedgeDelayMs > 0 && (!options.method || options.method === "GET" || options.method === "HEAD");
+// Sigue redirecciones manualmente para aplicar toFetchUrl (sslip.io/nip.io) en cada salto
+// y evitar Error 1003 / 502 cuando un broker redirige a una IP directa.
+async function fetchFollowingRedirects(rawTargetUrl, options, timeoutMs = UPSTREAM_TIMEOUT_MS, wildcard = "sslip.io") {
+  let currentRawUrl = rawTargetUrl;
+  let currentHeaders = new Headers(options.headers);
+  let currentMethod = options.method || "GET";
 
-  const runOnce = () => {
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    const parsedHop = new URL(currentRawUrl);
+    if (isBlockedHost(parsedHop.hostname)) {
+      throw new Error(`Redirección bloqueada a ${parsedHop.hostname}`);
+    }
+
+    const hopFetchUrl = toFetchUrl(currentRawUrl, wildcard);
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-    return {
-      ctrl,
-      promise: fetch(url, { ...options, signal: ctrl.signal }).finally(() => clearTimeout(timer)),
-    };
-  };
 
-  if (!canHedge) {
-    const single = runOnce();
-    const res = await single.promise;
-    return { res, hedged: false, activeCtrl: single.ctrl };
+    let res;
+    try {
+      res = await fetch(hopFetchUrl, {
+        method: currentMethod,
+        headers: currentHeaders,
+        redirect: "manual",
+        cf: options.cf,
+        body: currentMethod !== "GET" && currentMethod !== "HEAD" ? options.body : undefined,
+        signal: ctrl.signal,
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      throw err;
+    }
+    clearTimeout(timer);
+
+    if (res.status >= 300 && res.status < 400 && res.headers.has("location")) {
+      const loc = res.headers.get("location");
+      res.body?.cancel();
+      const nextUrl = new URL(loc, currentRawUrl);
+
+      if ((res.status === 301 || res.status === 302 || res.status === 303) && currentMethod === "POST") {
+        currentMethod = "GET";
+      }
+
+      // Actualiza cabeceras de origen al saltar a otro host
+      if (nextUrl.origin !== parsedHop.origin) {
+        currentHeaders.delete("authorization");
+        if (currentHeaders.has("sec-fetch-site")) {
+          currentHeaders.set("Sec-Fetch-Site", "cross-site");
+        }
+      }
+      currentRawUrl = nextUrl.href;
+      continue;
+    }
+
+    return { res, activeCtrl: ctrl, finalRawUrl: currentRawUrl, finalFetchUrl: hopFetchUrl };
   }
 
-  const primary = runOnce();
-  let backup = null;
-  let settled = false;
-
-  return new Promise((resolve, reject) => {
-    let errors = 0;
-    const totalExpected = () => (backup ? 2 : 1);
-
-    const handleSuccess = (res, isBackup, selfCtrl, otherCtrl) => {
-      if (settled) {
-        res.body?.cancel();
-        return;
-      }
-      if ((res.status >= 500 || res.status === 429) && backup && !isBackup) {
-        res.body?.cancel();
-        errors++;
-        if (errors >= totalExpected()) reject(new Error(`Upstream HTTP ${res.status}`));
-        return;
-      }
-      settled = true;
-      clearTimeout(hedgeTimer);
-      try { otherCtrl?.abort(); } catch (_) {}
-      resolve({ res, hedged: isBackup, activeCtrl: selfCtrl });
-    };
-
-    const handleFailure = (err) => {
-      if (settled) return;
-      errors++;
-      if (!backup || errors >= totalExpected()) {
-        settled = true;
-        clearTimeout(hedgeTimer);
-        reject(err);
-      }
-    };
-
-    const hedgeTimer = setTimeout(() => {
-      if (settled) return;
-      backup = runOnce();
-      backup.promise.then(
-        (res) => handleSuccess(res, true, backup.ctrl, primary.ctrl),
-        (err) => handleFailure(err)
-      );
-    }, hedgeDelayMs);
-
-    primary.promise.then(
-      (res) => handleSuccess(res, false, primary.ctrl, backup?.ctrl),
-      (err) => handleFailure(err)
-    );
-  });
+  throw new Error("Demasiadas redirecciones");
 }
 
-async function fetchWithRetry(url, options, { retry404 = false, hedgeDelayMs = HEDGE_DELAY_MS } = {}) {
+function buildMinimalFallbackHeaders(baseHeaders) {
+  const h = new Headers();
+  if (baseHeaders.has("user-agent")) h.set("User-Agent", baseHeaders.get("user-agent"));
+  h.set("Accept", "*/*");
+  if (baseHeaders.has("range")) h.set("Range", baseHeaders.get("range"));
+  return h;
+}
+
+async function fetchWithRetry(rawTargetUrl, options, { retry404 = false } = {}) {
   const canRetry = !options.method || options.method === "GET" || options.method === "HEAD";
   const max = canRetry ? UPSTREAM_RETRIES : 0;
-  let lastErr;
-  let usedHedge = false;
+  let lastErr = null;
+  let wildcard = "sslip.io";
+  let currentOptions = options;
 
   for (let i = 0; i <= max; i++) {
     try {
-      const out = await fetchWithHedge(url, options, {
-        hedgeDelayMs: i === 0 ? hedgeDelayMs : Math.min(hedgeDelayMs, 800),
-      });
-      if (out.hedged) usedHedge = true;
+      const out = await fetchFollowingRedirects(rawTargetUrl, currentOptions, UPSTREAM_TIMEOUT_MS, wildcard);
+      const st = out.res.status;
+      const bad = st >= 500 || st === 429 || (retry404 && st === 404);
 
-      const bad = out.res.status >= 500 || out.res.status === 429 || (retry404 && out.res.status === 404);
-      if (!bad || i === max) return { res: out.res, hedged: usedHedge, activeCtrl: out.activeCtrl };
+      if (!bad || i === max) return out;
 
       const retryAfter = Number(out.res.headers.get("retry-after"));
       out.res.body?.cancel();
-      const waitMs = out.res.status === 429 && retryAfter > 0 ? Math.min(retryAfter * 1000, 1500) : 200 * (i + 1);
+
+      // Si el origen devolvió 502/503, en el siguiente intento probamos cabeceras limpias y sin cf cache
+      if (st >= 500) {
+        currentOptions = {
+          ...currentOptions,
+          headers: buildMinimalFallbackHeaders(options.headers),
+          cf: { cacheEverything: false },
+        };
+      }
+
+      const waitMs = st === 429 && retryAfter > 0 ? Math.min(retryAfter * 1000, 1500) : 250 * (i + 1);
       await sleep(waitMs);
     } catch (err) {
       lastErr = err;
+      if (i === 0) {
+        wildcard = "nip.io";
+        currentOptions = {
+          ...currentOptions,
+          cf: { cacheEverything: false },
+        };
+      }
       if (i === max) throw err;
-      await sleep(200 * (i + 1));
+      await sleep(250 * (i + 1));
     }
   }
-  throw lastErr;
+  throw lastErr || new Error("Error upstream");
 }
 
-async function fetchRangeChunk(url, baseHeaders, start, end, ifRange, signal) {
+async function fetchRangeChunk(rawTargetUrl, baseHeaders, start, end, ifRange, signal) {
   for (let attempt = 0; attempt <= UPSTREAM_RETRIES; attempt++) {
     if (signal?.aborted) throw new Error("Aborted");
     const ctrl = new AbortController();
     const onExtAbort = () => ctrl.abort();
     signal?.addEventListener("abort", onExtAbort, { once: true });
 
-    const connectTimer = setTimeout(() => ctrl.abort(), UPSTREAM_TIMEOUT_MS);
     try {
       const h = new Headers(baseHeaders);
       h.set("Range", `bytes=${start}-${end}`);
       if (ifRange) h.set("If-Range", ifRange);
 
-      const res = await fetch(url, {
-        method: "GET",
-        headers: h,
-        redirect: "follow",
-        signal: ctrl.signal,
-        cf: { cacheEverything: false },
-      });
-      clearTimeout(connectTimer);
+      const wildcard = attempt > 0 ? "nip.io" : "sslip.io";
+      const out = await fetchFollowingRedirects(
+        rawTargetUrl,
+        { method: "GET", headers: h, cf: { cacheEverything: false } },
+        UPSTREAM_TIMEOUT_MS,
+        wildcard
+      );
+      const res = out.res;
 
       if (res.status !== 206) {
         res.body?.cancel();
         if ((res.status >= 500 || res.status === 429) && attempt < UPSTREAM_RETRIES) {
-          await sleep(180 * (attempt + 1));
+          await sleep(200 * (attempt + 1));
           continue;
         }
         throw new Error(`Chunk esperaba 206, recibió ${res.status}`);
       }
 
       const expectedLen = end - start + 1;
-      return await readBytesWithStallTimeout(res.body, expectedLen, STALL_TIMEOUT_MS, ctrl);
+      return await readBytesWithStallTimeout(res.body, expectedLen, STALL_TIMEOUT_MS, out.activeCtrl);
     } catch (err) {
-      clearTimeout(connectTimer);
       if (signal?.aborted || attempt === UPSTREAM_RETRIES) throw err;
-      await sleep(180 * (attempt + 1));
+      await sleep(200 * (attempt + 1));
     } finally {
       signal?.removeEventListener("abort", onExtAbort);
     }
@@ -582,7 +592,7 @@ function createMultiRangePump({ url, headers, startByte, endByte, ifRange, concu
 function createResilientBody({
   initialRes,
   initialCtrl,
-  fetchUrl,
+  rawTargetUrl,
   targetHost,
   upstreamHeaders,
   expectedEnd,
@@ -616,7 +626,7 @@ function createResilientBody({
     const cursor = startOffset + bytesDelivered;
     mode = "multi";
     multiPump = createMultiRangePump({
-      url: fetchUrl,
+      url: rawTargetUrl,
       headers: upstreamHeaders,
       startByte: cursor,
       endByte: expectedEnd,
@@ -642,21 +652,13 @@ function createResilientBody({
       throw new Error("El origen no soporta Range para reanudar");
     }
 
-    const ctrl = new AbortController();
-    activeCtrl = ctrl;
-    const timer = setTimeout(() => ctrl.abort(), UPSTREAM_TIMEOUT_MS);
-    let r;
-    try {
-      r = await fetch(fetchUrl, {
-        method: "GET",
-        headers: h,
-        redirect: "follow",
-        signal: ctrl.signal,
-        cf: { cacheEverything: false },
-      });
-    } finally {
-      clearTimeout(timer);
-    }
+    const out = await fetchFollowingRedirects(
+      rawTargetUrl,
+      { method: "GET", headers: h, cf: { cacheEverything: false } },
+      UPSTREAM_TIMEOUT_MS
+    );
+    const r = out.res;
+    activeCtrl = out.activeCtrl;
 
     if (cursor > 0 && r.status !== 206) {
       r.body?.cancel();
@@ -813,7 +815,7 @@ function createContinuousStreamWithWatchdog(body, initialCtrl) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. ENTRYPOINT PRINCIPAL DEL WORKER
+// 5. ENTRYPOINT PRINCIPAL
 // ---------------------------------------------------------------------------
 export default {
   async fetch(request, env, ctx) {
@@ -824,7 +826,7 @@ export default {
       "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, OPTIONS",
       "Access-Control-Allow-Headers": "*",
       "Access-Control-Expose-Headers":
-        "Content-Length, Content-Range, Content-Type, Accept-Ranges, Date, ETag, Set-Cookie, X-Proxy-Cache, X-Proxy-Resilience",
+        "Content-Length, Content-Range, Content-Type, Accept-Ranges, Date, ETag, Set-Cookie, X-Proxy-Cache, X-Proxy-Resilience, X-Proxy-Error",
       "Vary": "Origin",
     };
     if (reqOrigin) {
@@ -847,7 +849,6 @@ export default {
           ? Number(env.THROTTLE_FLOOR_BPS)
           : THROTTLE_FLOOR_BPS;
 
-      // 1+2. IDENTIDAD (origin/referer/ua) Y URL DESTINO
       let identity;
       let targetUrl = "";
       const idMatch = reqUrl.pathname.match(/^\/i\/([A-Za-z0-9_-]+)\/(.+)$/);
@@ -908,7 +909,6 @@ export default {
       const customOrigin = normalizeOrigin(identity.o);
       const customReferer = identity.r || null;
       const customUa = identity.u || null;
-      const fetchUrl = toFetchUrl(targetUrl);
 
       const upstreamHeaders = buildUpstreamHeaders({
         request,
@@ -922,11 +922,11 @@ export default {
       const cleanTarget = parsedTarget.pathname.toLowerCase();
       const kind = classify(cleanTarget);
 
-      const staleKey = new Request(`https://stale.proxy.internal/${encodeURIComponent(fetchUrl)}`);
-      const segCacheKey = new Request(`https://seg.proxy.internal/${encodeURIComponent(fetchUrl)}`);
+      const staleKey = new Request(`https://stale.proxy.internal/${encodeURIComponent(targetUrl)}`);
+      const segCacheKey = new Request(`https://seg.proxy.internal/${encodeURIComponent(targetUrl)}`);
       const clientRange = parseSingleRangeRequest(request.headers.get("range"));
 
-      // 3. LECTURA RÁPIDA EN CACHÉ EDGE (Cache API) PARA SEGMENTOS
+      // Caché Edge para segmentos
       if (
         request.method === "GET" &&
         kind === "segment" &&
@@ -942,7 +942,7 @@ export default {
         }
       }
 
-      // 4. ACELERACIÓN PROACTIVA AUTOMÁTICA SI EL HOST YA DEMOSTRÓ BAJA VELOCIDAD
+      // Aceleración automática si el host demostró throttling previo
       let preFetchedOut = null;
       const shouldAutoParallel =
         request.method === "GET" &&
@@ -960,9 +960,9 @@ export default {
         let probeOut = null;
         try {
           probeOut = await fetchWithRetry(
-            fetchUrl,
-            { method: "GET", headers: probeHeaders, redirect: "follow", cf: { cacheEverything: false } },
-            { retry404: kind === "segment", hedgeDelayMs: HEDGE_DELAY_MS }
+            targetUrl,
+            { method: "GET", headers: probeHeaders, cf: { cacheEverything: false } },
+            { retry404: kind === "segment" }
           );
         } catch (_) {
           probeOut = null;
@@ -986,7 +986,7 @@ export default {
               const ifRange = probeRes.headers.get("etag") || probeRes.headers.get("last-modified") || null;
 
               const pump = createMultiRangePump({
-                url: fetchUrl,
+                url: probeOut.finalRawUrl || targetUrl,
                 headers: upstreamHeaders,
                 startByte: probeStart,
                 endByte: totalEnd,
@@ -1053,7 +1053,6 @@ export default {
           }
         } else if (probeOut && probeOut.res) {
           if (probeOut.res.status === 200 && !clientRange) {
-            // El origen ignoró Range: lo recordamos y reutilizamos esta misma respuesta sin repetir fetch
             markMapTtl(noRangeHosts, targetHost, NO_RANGE_HOST_TTL_MS);
             preFetchedOut = probeOut;
           } else if (!probeOut.res.ok) {
@@ -1064,11 +1063,10 @@ export default {
         }
       }
 
-      // 5. FETCH PRINCIPAL AL ORIGEN (CACHÉ POR TIPO + HEDGING + RETRIES + STALE)
+      // Fetch principal
       const fetchOptions = {
         method: request.method,
         headers: upstreamHeaders,
-        redirect: "follow",
         cf: cfOptions(kind),
       };
       if (request.method !== "GET" && request.method !== "HEAD") {
@@ -1076,20 +1074,21 @@ export default {
       }
 
       let out = preFetchedOut;
+      let fetchErr = null;
       if (!out) {
         try {
-          out = await fetchWithRetry(fetchUrl, fetchOptions, {
+          out = await fetchWithRetry(targetUrl, fetchOptions, {
             retry404: kind === "segment",
-            hedgeDelayMs: kind === "stream" ? 2500 : HEDGE_DELAY_MS,
           });
-        } catch (_) {
+        } catch (err) {
+          fetchErr = err;
           out = null;
         }
       }
 
       const res = out ? out.res : null;
-      const hedged = out ? out.hedged : false;
       const initialCtrl = out ? out.activeCtrl : null;
+      const resolvedRawUrl = out ? out.finalRawUrl : targetUrl;
 
       if ((!res || res.status >= 500) && request.method === "GET") {
         const stale = await caches.default.match(staleKey).catch(() => null);
@@ -1108,40 +1107,53 @@ export default {
       }
 
       if (!res) {
-        return new Response("Origen no disponible", {
+        const reason = fetchErr
+          ? (fetchErr.name === "AbortError" ? `Timeout (${UPSTREAM_TIMEOUT_MS}ms)` : fetchErr.message)
+          : "Sin respuesta";
+        return new Response(`Origen no disponible (${reason})`, {
           status: 502,
-          headers: { ...corsHeaders, "Content-Type": "text/plain; charset=utf-8" },
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "text/plain; charset=utf-8",
+            "X-Proxy-Error": reason.slice(0, 200),
+          },
         });
       }
 
       if (request.method === "HEAD") {
         const headHeaders = new Headers(res.headers);
         for (const [k, v] of Object.entries(corsHeaders)) headHeaders.set(k, v);
-        headHeaders.set("X-Proxy-Resilience", hedged ? "hedged" : "direct");
+        headHeaders.set("X-Proxy-Resilience", "direct");
         return new Response(null, { status: res.status, headers: headHeaders });
       }
 
       if (!res.ok && res.status !== 206) {
         const errorText = await res.text();
-        return new Response(errorText, {
+        return new Response(errorText || `Upstream HTTP ${res.status}`, {
           status: res.status,
-          headers: { ...corsHeaders, "Content-Type": "text/plain; charset=utf-8" },
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "text/plain; charset=utf-8",
+            "X-Proxy-Error": `Upstream HTTP ${res.status}`,
+          },
         });
       }
 
-      // 6. HELPERS PARA MANIFIESTOS Y PREFETCH
-      const baseUrl = new URL("./", parsedTarget).href;
+      // Helpers para manifiestos y prefetch
+      const baseTargetUrl = resolvedRawUrl || targetUrl;
+      const baseUrl = new URL("./", baseTargetUrl).href;
       const hasIdentity = customOrigin || customReferer || customUa;
       const proxyPrefix = hasIdentity
         ? `${reqUrl.origin}/i/${encodeIdentity({ o: customOrigin, r: customReferer, u: customUa })}/`
         : `${reqUrl.origin}/p/`;
-      const manifestSearchParams = parsedTarget.search;
+      const manifestSearchParams = new URL(baseTargetUrl).search;
+      const baseOrigin = new URL(baseTargetUrl).origin;
 
       function resolveUpstream(pathOrUrl) {
         const trimmed = pathOrUrl.trim();
         const isExplicitAbsolute = /^https?:\/\//i.test(trimmed);
         const resolved = new URL(trimmed, baseUrl);
-        if (!resolved.search && manifestSearchParams && (!isExplicitAbsolute || resolved.origin === parsedTarget.origin)) {
+        if (!resolved.search && manifestSearchParams && (!isExplicitAbsolute || resolved.origin === baseOrigin)) {
           resolved.search = manifestSearchParams;
         }
         return resolved;
@@ -1188,8 +1200,7 @@ export default {
         for (const uri of uris) {
           try {
             const rawTarget = resolveUpstream(uri).href;
-            const targetFetchUrl = toFetchUrl(rawTarget);
-            const cacheReq = new Request(`https://seg.proxy.internal/${encodeURIComponent(targetFetchUrl)}`);
+            const cacheReq = new Request(`https://seg.proxy.internal/${encodeURIComponent(rawTarget)}`);
 
             ctx.waitUntil(
               (async () => {
@@ -1198,11 +1209,12 @@ export default {
                   hit.body?.cancel();
                   return;
                 }
-                const r = await fetch(targetFetchUrl, {
-                  headers: prefetchHeaders,
-                  redirect: "follow",
-                  cf: cfOptions("segment"),
-                });
+                const outSeg = await fetchFollowingRedirects(
+                  rawTarget,
+                  { method: "GET", headers: prefetchHeaders, cf: cfOptions("segment") },
+                  UPSTREAM_TIMEOUT_MS
+                );
+                const r = outSeg.res;
                 if (!r.ok || !r.body) {
                   r.body?.cancel();
                   return;
@@ -1231,7 +1243,6 @@ export default {
         return h;
       }
 
-      // 7. DETECCIÓN DE CONTENIDO
       const rawContentType = (res.headers.get("content-type") || "").toLowerCase();
       let isHls = cleanTarget.endsWith(".m3u8") || rawContentType.includes("mpegurl");
       let isDash = cleanTarget.endsWith(".mpd") || rawContentType.includes("dash+xml");
@@ -1243,7 +1254,7 @@ export default {
         else if (/<MPD[\s>]/i.test(responseText)) isDash = true;
       }
 
-      // CASO A: HLS (.m3u8) CON ADAPTADOR CESBO ASTRA
+      // CASO A: HLS (.m3u8)
       if (isHls) {
         const original = responseText !== null ? responseText : await res.text();
         const text = patchAstraHlsManifest(original, makeProxied);
@@ -1258,7 +1269,7 @@ export default {
         hlsHeaders.delete("content-encoding");
         hlsHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate");
         hlsHeaders.set("X-Proxy-Cache", res.headers.get("cf-cache-status") || "MISS");
-        hlsHeaders.set("X-Proxy-Resilience", hedged ? "hedged" : "direct");
+        hlsHeaders.set("X-Proxy-Resilience", "direct");
 
         return new Response(text, { status: res.status, headers: hlsHeaders });
       }
@@ -1266,30 +1277,42 @@ export default {
       // CASO B: MPEG-DASH (.mpd)
       if (isDash) {
         let text = responseText !== null ? responseText : await res.text();
-        const proxiedBase = `<BaseURL>${proxyPrefix}${baseUrl}</BaseURL>`;
+        text = text.replace(/^\uFEFF/, "").trimStart();
+        text = text.replace(
+          /^(<\?xml\b[^>]*\bencoding\s*=\s*["'])utf-8(["'][^>]*\?>)/i,
+          "$1UTF-8$2"
+        );
+
+        const proxiedBase = `<BaseURL>${escapeXmlText(`${proxyPrefix}${baseUrl}`)}</BaseURL>`;
 
         if (/<BaseURL[^>]*>/i.test(text)) {
-          text = text.replace(/<BaseURL([^>]*)>([^<]+)<\/BaseURL>/gi, (_, attrs, p1) => `<BaseURL${attrs}>${makeProxied(p1)}</BaseURL>`);
+          text = text.replace(
+            /<BaseURL([^>]*)>([^<]+)<\/BaseURL>/gi,
+            (_, attrs, p1) => `<BaseURL${attrs}>${escapeXmlText(makeProxied(p1))}</BaseURL>`
+          );
         } else {
           text = text.replace(/<MPD([^>]*)>/i, `<MPD$1>\n  ${proxiedBase}`);
         }
-        text = text.replace(/<Location>([^<]+)<\/Location>/gi, (_, p1) => `<Location>${makeProxied(p1)}</Location>`);
+        text = text.replace(
+          /<Location>([^<]+)<\/Location>/gi,
+          (_, p1) => `<Location>${escapeXmlText(makeProxied(p1))}</Location>`
+        );
 
         if (request.method === "GET" && res.status === 200) {
-          rememberManifest(text, "application/dash+xml; charset=utf-8");
+          rememberManifest(text, "application/dash+xml; charset=UTF-8");
         }
 
-        const dashHeaders = createResponseHeaders("application/dash+xml; charset=utf-8");
+        const dashHeaders = createResponseHeaders("application/dash+xml; charset=UTF-8");
         dashHeaders.delete("content-length");
         dashHeaders.delete("content-encoding");
         dashHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate");
         dashHeaders.set("X-Proxy-Cache", res.headers.get("cf-cache-status") || "MISS");
-        dashHeaders.set("X-Proxy-Resilience", hedged ? "hedged" : "direct");
+        dashHeaders.set("X-Proxy-Resilience", "direct");
 
         return new Response(text, { status: res.status, headers: dashHeaders });
       }
 
-      // CASO C: STREAM CONTINUO MPEG-TS (SIN CACHÉ, CON WATCHDOG ANTI-CONGELAMIENTO)
+      // CASO C: STREAM CONTINUO MPEG-TS
       const binaryHeaders = createResponseHeaders();
       const cacheStatus = res.headers.get("cf-cache-status");
       if (cacheStatus) binaryHeaders.set("X-Proxy-Cache", cacheStatus);
@@ -1303,12 +1326,12 @@ export default {
       if (isLiveContinuous) {
         binaryHeaders.set("Content-Type", "video/mp2t");
         binaryHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate");
-        binaryHeaders.set("X-Proxy-Resilience", hedged ? "hedged-stream" : "live-stream");
+        binaryHeaders.set("X-Proxy-Resilience", "live-stream");
         const streamBody = res.body ? createContinuousStreamWithWatchdog(res.body, initialCtrl) : null;
         return new Response(streamBody, { status: res.status, headers: binaryHeaders });
       }
 
-      // CASO D: SEGMENTOS / VOD / BINARIOS CON BLINDAJE ANTI-THROTTLING Y ANTI-STALL
+      // CASO D: SEGMENTOS / VOD / BINARIOS CON BLINDAJE ANTI-THROTTLING
       if (cleanTarget.endsWith(".ts")) {
         binaryHeaders.set("Content-Type", "video/mp2t");
         binaryHeaders.set("Cache-Control", `public, max-age=${SEGMENT_TTL_S}`);
@@ -1348,7 +1371,7 @@ export default {
       let outStream = createResilientBody({
         initialRes: res,
         initialCtrl,
-        fetchUrl,
+        rawTargetUrl: resolvedRawUrl || targetUrl,
         targetHost,
         upstreamHeaders,
         expectedEnd,
@@ -1374,7 +1397,7 @@ export default {
         );
       }
 
-      binaryHeaders.set("X-Proxy-Resilience", hedged ? "hedged-adaptive" : "adaptive");
+      binaryHeaders.set("X-Proxy-Resilience", "adaptive");
       return new Response(outStream, { status: res.status, headers: binaryHeaders });
     } catch (err) {
       return new Response("Error al procesar stream: " + err.message, {
